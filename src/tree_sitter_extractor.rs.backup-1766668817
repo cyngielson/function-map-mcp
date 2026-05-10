@@ -1,0 +1,1759 @@
+//! Tree-sitter AST-based Function Extractor
+//!
+//! High-precision function extraction using tree-sitter for proper AST parsing.
+//! Replaces regex-based extraction for better accuracy with:
+//! - Nested function detection
+//! - Generic type parameter parsing
+//! - Multiline signature handling
+//! - Proper scope boundary detection
+
+use anyhow::{Result, anyhow};
+use tree_sitter::{Parser, Language, Node, Tree};
+use serde::{Deserialize, Serialize};
+
+/// Supported languages for tree-sitter parsing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SupportedLanguage {
+    // Systems programming
+    Rust,
+    C,
+    Cpp,
+    Go,
+    // JVM languages
+    Java,
+    Kotlin,
+    Scala,
+    // Scripting & interpreted
+    Python,
+    Ruby,
+    // Web frontend
+    JavaScript,
+    TypeScript,
+    // Mobile
+    Swift,
+    // .NET
+    CSharp,
+    // Shell
+    // Shell
+    Bash,
+    // Web Development
+    Html,
+    Css,
+    Php,
+}
+
+impl SupportedLanguage {
+    /// Get tree-sitter language from enum
+    pub fn get_language(&self) -> Language {
+        match self {
+            // Systems programming
+            SupportedLanguage::Rust => tree_sitter_rust::language(),
+            SupportedLanguage::C => tree_sitter_c::language(),
+            SupportedLanguage::Cpp => tree_sitter_cpp::language(),
+            SupportedLanguage::Go => tree_sitter_go::language(),
+            // JVM languages
+            SupportedLanguage::Java => tree_sitter_java::language(),
+            SupportedLanguage::Kotlin => tree_sitter_kotlin::language(),
+            SupportedLanguage::Scala => tree_sitter_scala::language(),
+            // Scripting
+            SupportedLanguage::Python => tree_sitter_python::language(),
+            SupportedLanguage::Ruby => tree_sitter_ruby::language(),
+            // Web frontend
+            SupportedLanguage::JavaScript => tree_sitter_javascript::language(),
+            SupportedLanguage::TypeScript => tree_sitter_typescript::language_typescript(),
+            // Mobile
+            SupportedLanguage::Swift => devgen_tree_sitter_swift::language(),
+            // .NET
+            SupportedLanguage::CSharp => tree_sitter_c_sharp::language(),
+            // Shell
+            SupportedLanguage::Bash => tree_sitter_bash::language(),
+        }
+    }
+
+    /// Detect language from file extension
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_lowercase().as_str() {
+            // Systems
+            "rs" => Some(SupportedLanguage::Rust),
+            "c" | "h" => Some(SupportedLanguage::C),
+            "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "c++" => Some(SupportedLanguage::Cpp),
+            "go" => Some(SupportedLanguage::Go),
+            // JVM
+            "java" => Some(SupportedLanguage::Java),
+            "kt" | "kts" => Some(SupportedLanguage::Kotlin),
+            "scala" | "sc" => Some(SupportedLanguage::Scala),
+            // Scripting
+            "py" | "pyw" | "pyi" => Some(SupportedLanguage::Python),
+            "rb" | "rbw" | "rake" | "gemspec" => Some(SupportedLanguage::Ruby),
+            // Web frontend
+            "js" | "mjs" | "jsx" => Some(SupportedLanguage::JavaScript),
+            "ts" | "tsx" | "mts" => Some(SupportedLanguage::TypeScript),
+            // Mobile
+            "swift" => Some(SupportedLanguage::Swift),
+            // .NET
+            "cs" => Some(SupportedLanguage::CSharp),
+            // Shell
+            "sh" | "bash" | "zsh" => Some(SupportedLanguage::Bash),
+            // Note: PHP/HTML/CSS/JSON use regex fallback in psi_graph.rs
+            _ => None,
+        }
+    }
+
+    /// Get function node types for this language
+    fn function_node_types(&self) -> &[&str] {
+        match self {
+            SupportedLanguage::Rust => &[
+                "function_item",
+                "impl_item",
+                "struct_item",
+                "trait_item",
+                "enum_item",
+            ],
+            SupportedLanguage::Python => &[
+                "function_definition",
+                "class_definition",
+                "decorated_definition",
+            ],
+            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => &[
+                "function_declaration",
+                "function_expression",
+                "arrow_function",
+                "method_definition",
+                "class_declaration",
+                "generator_function",
+                "generator_function_declaration",
+            ],
+            SupportedLanguage::Java => &[
+                "method_declaration",
+                "constructor_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+            ],
+            SupportedLanguage::Go => &[
+                "function_declaration",
+                "method_declaration",
+                "type_declaration",
+            ],
+            SupportedLanguage::C | SupportedLanguage::Cpp => &[
+                "function_definition",
+                "declaration",
+                "struct_specifier",
+                "class_specifier",
+            ],
+            SupportedLanguage::Kotlin => &[
+                "function_declaration",
+                "class_declaration",
+                "object_declaration",
+                "companion_object",
+                "secondary_constructor",
+                "property_declaration",
+            ],
+            SupportedLanguage::Swift => &[
+                "function_declaration",
+                "class_declaration",
+                "struct_declaration",
+                "protocol_declaration",
+                "enum_declaration",
+                "initializer_declaration",
+                "deinitializer_declaration",
+            ],
+            SupportedLanguage::Ruby => &[
+                "method",
+                "singleton_method",
+                "class",
+                "module",
+            ],
+            SupportedLanguage::CSharp => &[
+                "method_declaration",
+                "constructor_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+                "property_declaration",
+            ],
+            SupportedLanguage::Scala => &[
+                "function_definition",
+                "val_definition",
+                "class_definition",
+                "object_definition",
+                "trait_definition",
+            ],
+            SupportedLanguage::Bash => &[
+                "function_definition",
+                "command",
+            ],
+        }
+    }
+}
+
+/// Extracted function information from AST
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ASTFunction {
+    pub name: String,
+    pub signature: String,
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub language: String,
+    pub kind: FunctionKind,
+    pub visibility: Visibility,
+    pub is_async: bool,
+    pub parameters: Vec<Parameter>,
+    pub return_type: Option<String>,
+    pub body_lines: usize,
+    pub complexity: usize,
+    pub nested_functions: Vec<String>,
+    pub docstring: Option<String>,
+}
+
+/// Function kind classification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FunctionKind {
+    Function,
+    Method,
+    Constructor,
+    Destructor,
+    Getter,
+    Setter,
+    StaticMethod,
+    ClassMethod,
+    AsyncFunction,
+    Generator,
+    Lambda,
+    Closure,
+    Trait,
+    Impl,
+    Struct,
+    Class,
+    Interface,
+    Enum,
+}
+
+/// Visibility modifier
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum Visibility {
+    Public,
+    Private,
+    Protected,
+    Internal,
+    Package,
+    Unknown,
+}
+
+/// Parameter information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Parameter {
+    pub name: String,
+    pub param_type: Option<String>,
+    pub default_value: Option<String>,
+    pub is_variadic: bool,
+}
+
+/// Tree-sitter based function extractor
+pub struct TreeSitterExtractor {
+    parsers: std::collections::HashMap<SupportedLanguage, Parser>,
+}
+
+impl TreeSitterExtractor {
+    /// Create new extractor with all language parsers initialized
+    pub fn new() -> Result<Self> {
+        let mut parsers = std::collections::HashMap::new();
+
+        for lang in &[
+            // Systems programming
+            SupportedLanguage::Rust,
+            SupportedLanguage::C,
+            SupportedLanguage::Cpp,
+            SupportedLanguage::Go,
+            // JVM languages
+            SupportedLanguage::Java,
+            SupportedLanguage::Kotlin,
+            SupportedLanguage::Scala,
+            // Scripting
+            SupportedLanguage::Python,
+            SupportedLanguage::Ruby,
+            // Web frontend
+            SupportedLanguage::JavaScript,
+            SupportedLanguage::TypeScript,
+            // Mobile
+            SupportedLanguage::Swift,
+            // .NET
+            SupportedLanguage::CSharp,
+            // Shell
+            SupportedLanguage::Bash,
+            // Note: PHP/HTML/CSS/JSON use regex fallback in psi_graph.rs
+        ] {
+            let mut parser = Parser::new();
+            parser.set_language(&lang.get_language())
+                .map_err(|e| anyhow!("Failed to set language {:?}: {}", lang, e))?;
+            parsers.insert(*lang, parser);
+        }
+
+        Ok(Self { parsers })
+    }
+
+    /// Extract functions from source code
+    pub fn extract_functions(
+        &mut self,
+        source: &str,
+        file_path: &str,
+        language: SupportedLanguage,
+    ) -> Result<Vec<ASTFunction>> {
+        let parser = self.parsers.get_mut(&language)
+            .ok_or_else(|| anyhow!("Parser not found for {:?}", language))?;
+
+        let tree = parser.parse(source, None)
+            .ok_or_else(|| anyhow!("Failed to parse source code"))?;
+
+        let mut functions = Vec::new();
+        let root_node = tree.root_node();
+        let source_bytes = source.as_bytes();
+
+        self.traverse_node(
+            root_node,
+            source_bytes,
+            file_path,
+            language,
+            &mut functions,
+            &tree,
+            source,
+        );
+
+        Ok(functions)
+    }
+
+    /// Recursively traverse AST nodes to find functions
+    fn traverse_node(
+        &self,
+        node: Node,
+        source: &[u8],
+        file_path: &str,
+        language: SupportedLanguage,
+        functions: &mut Vec<ASTFunction>,
+        tree: &Tree,
+        source_str: &str,
+    ) {
+        let node_type = node.kind();
+        let function_types = language.function_node_types();
+
+        if function_types.contains(&node_type) {
+            if let Some(func) = self.extract_function_info(node, source, file_path, language, source_str) {
+                functions.push(func);
+            }
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.traverse_node(child, source, file_path, language, functions, tree, source_str);
+        }
+    }
+
+    /// Extract detailed function information from AST node
+    fn extract_function_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        file_path: &str,
+        language: SupportedLanguage,
+        source_str: &str,
+    ) -> Option<ASTFunction> {
+        let node_type = node.kind();
+        let start_line = node.start_position().row + 1;
+        let end_line = node.end_position().row + 1;
+        let start_byte = node.start_byte();
+        let end_byte = node.end_byte();
+
+        // Get node text
+        let node_text = std::str::from_utf8(&source[start_byte..end_byte]).ok()?;
+
+        // Extract name based on language and node type
+        let (name, kind, visibility, is_async, signature) = match language {
+            SupportedLanguage::Rust => self.extract_rust_info(node, source, node_type)?,
+            SupportedLanguage::Python => self.extract_python_info(node, source, node_type)?,
+            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => {
+                self.extract_js_ts_info(node, source, node_type)?
+            }
+            SupportedLanguage::Java => self.extract_java_info(node, source, node_type)?,
+            SupportedLanguage::Go => self.extract_go_info(node, source, node_type)?,
+            SupportedLanguage::C | SupportedLanguage::Cpp => {
+                self.extract_c_cpp_info(node, source, node_type)?
+            }
+            SupportedLanguage::Kotlin => self.extract_kotlin_info(node, source, node_type)?,
+            SupportedLanguage::Swift => self.extract_swift_info(node, source, node_type)?,
+            SupportedLanguage::Ruby => self.extract_ruby_info(node, source, node_type)?,
+            SupportedLanguage::CSharp => self.extract_csharp_info(node, source, node_type)?,
+            SupportedLanguage::Scala => self.extract_scala_info(node, source, node_type)?,
+            SupportedLanguage::Bash => self.extract_bash_info(node, source, node_type)?,
+        };
+
+        // Calculate complexity (count control flow nodes)
+        let complexity = self.calculate_complexity_ast(node, language);
+
+        // Count body lines (excluding empty lines)
+        let body_lines = node_text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+
+        // Extract docstring (comment before function)
+        let docstring = self.extract_docstring(node, source, source_str, start_line);
+
+        // Find nested functions
+        let nested_functions = self.find_nested_functions(node, source, language);
+
+        // Extract parameters
+        let parameters = self.extract_parameters(node, source, language);
+
+        // Extract return type
+        let return_type = self.extract_return_type(node, source, language);
+
+        Some(ASTFunction {
+            name,
+            signature,
+            file_path: file_path.to_string(),
+            start_line,
+            end_line,
+            start_byte,
+            end_byte,
+            language: format!("{:?}", language).to_lowercase(),
+            kind,
+            visibility,
+            is_async,
+            parameters,
+            return_type,
+            body_lines,
+            complexity,
+            nested_functions,
+            docstring,
+        })
+    }
+
+    // ==================== RUST EXTRACTION ====================
+
+    fn extract_rust_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let mut cursor = node.walk();
+
+        match node_type {
+            "function_item" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let is_async = node.child_by_field_name("async_keyword").is_some() ||
+                              self.node_text(node, source).contains("async ");
+                let visibility = if self.node_text(node, source).starts_with("pub") {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+
+                // Build signature
+                let sig = self.build_rust_signature(node, source);
+
+                Some((name, FunctionKind::Function, visibility, is_async, sig))
+            }
+            "impl_item" => {
+                // Get the type being implemented
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let name = self.node_text(type_node, source);
+                    let kind = if node.child_by_field_name("trait").is_some() {
+                        FunctionKind::Impl
+                    } else {
+                        FunctionKind::Impl
+                    };
+                    let sig = format!("impl {}", name);
+                    Some((name, kind, Visibility::Public, false, sig))
+                } else {
+                    None
+                }
+            }
+            "struct_item" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let visibility = if self.node_text(node, source).starts_with("pub") {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                let sig = format!("struct {}", name);
+                Some((name, FunctionKind::Struct, visibility, false, sig))
+            }
+            "trait_item" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("trait {}", name);
+                Some((name, FunctionKind::Trait, Visibility::Public, false, sig))
+            }
+            "enum_item" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let visibility = if self.node_text(node, source).starts_with("pub") {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                let sig = format!("enum {}", name);
+                Some((name, FunctionKind::Enum, visibility, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    fn build_rust_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        // Get first line or until {
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== PYTHON EXTRACTION ====================
+
+    fn extract_python_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        match node_type {
+            "function_definition" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let is_async = self.node_text(node, source).trim_start().starts_with("async");
+                let visibility = if name.starts_with("__") && !name.ends_with("__") {
+                    Visibility::Private
+                } else if name.starts_with("_") {
+                    Visibility::Protected
+                } else {
+                    Visibility::Public
+                };
+                let kind = if is_async {
+                    FunctionKind::AsyncFunction
+                } else {
+                    FunctionKind::Function
+                };
+                let sig = self.build_python_signature(node, source);
+                Some((name, kind, visibility, is_async, sig))
+            }
+            "class_definition" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, Visibility::Public, false, sig))
+            }
+            "decorated_definition" => {
+                // Get the inner function/class
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "function_definition" || child.kind() == "class_definition" {
+                        return self.extract_python_info(child, source, child.kind());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn build_python_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        // Get def line
+        if let Some(colon_pos) = text.find(':') {
+            text[..colon_pos + 1].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== JAVASCRIPT/TYPESCRIPT EXTRACTION ====================
+
+    fn extract_js_ts_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+        let is_async = text.contains("async ");
+
+        match node_type {
+            "function_declaration" | "function_expression" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .unwrap_or_else(|| "anonymous".to_string());
+                let sig = self.build_js_signature(node, source);
+                Some((name, FunctionKind::Function, Visibility::Public, is_async, sig))
+            }
+            "arrow_function" => {
+                // Arrow functions might be assigned to a variable
+                let name = if let Some(parent) = node.parent() {
+                    if parent.kind() == "variable_declarator" {
+                        self.find_child_by_field(parent, "name", source)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }.unwrap_or_else(|| "arrow_fn".to_string());
+
+                let kind = if is_async {
+                    FunctionKind::AsyncFunction
+                } else {
+                    FunctionKind::Lambda
+                };
+                let sig = format!("const {} = {}", name, text.lines().next().unwrap_or("()=>"));
+                Some((name, kind, Visibility::Public, is_async, sig))
+            }
+            "method_definition" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let kind = if name == "constructor" {
+                    FunctionKind::Constructor
+                } else if text.contains("static ") {
+                    FunctionKind::StaticMethod
+                } else if text.contains("get ") {
+                    FunctionKind::Getter
+                } else if text.contains("set ") {
+                    FunctionKind::Setter
+                } else {
+                    FunctionKind::Method
+                };
+                let sig = self.build_js_signature(node, source);
+                Some((name, kind, Visibility::Public, is_async, sig))
+            }
+            "class_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, Visibility::Public, false, sig))
+            }
+            "generator_function" | "generator_function_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .unwrap_or_else(|| "generator".to_string());
+                let sig = self.build_js_signature(node, source);
+                Some((name, FunctionKind::Generator, Visibility::Public, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    fn build_js_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== JAVA EXTRACTION ====================
+
+    fn extract_java_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+
+        let visibility = if text.contains("public ") {
+            Visibility::Public
+        } else if text.contains("private ") {
+            Visibility::Private
+        } else if text.contains("protected ") {
+            Visibility::Protected
+        } else {
+            Visibility::Package
+        };
+
+        match node_type {
+            "method_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let kind = if text.contains("static ") {
+                    FunctionKind::StaticMethod
+                } else {
+                    FunctionKind::Method
+                };
+                let sig = self.build_java_signature(node, source);
+                Some((name, kind, visibility, false, sig))
+            }
+            "constructor_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_java_signature(node, source);
+                Some((name, FunctionKind::Constructor, visibility, false, sig))
+            }
+            "class_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, visibility, false, sig))
+            }
+            "interface_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("interface {}", name);
+                Some((name, FunctionKind::Interface, visibility, false, sig))
+            }
+            "enum_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("enum {}", name);
+                Some((name, FunctionKind::Enum, visibility, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    fn build_java_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== GO EXTRACTION ====================
+
+    fn extract_go_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        match node_type {
+            "function_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                let sig = self.build_go_signature(node, source);
+                Some((name, FunctionKind::Function, visibility, false, sig))
+            }
+            "method_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                let sig = self.build_go_signature(node, source);
+                Some((name, FunctionKind::Method, visibility, false, sig))
+            }
+            "type_declaration" => {
+                // Get inner type spec
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "type_spec" {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let name = self.node_text(name_node, source);
+                            let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                                Visibility::Public
+                            } else {
+                                Visibility::Private
+                            };
+                            let sig = format!("type {}", name);
+                            return Some((name, FunctionKind::Struct, visibility, false, sig));
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn build_go_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== C/C++ EXTRACTION ====================
+
+    fn extract_c_cpp_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+
+        match node_type {
+            "function_definition" => {
+                // Try to get declarator
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    let name = self.extract_c_function_name(declarator, source)?;
+                    let visibility = if text.contains("static ") {
+                        Visibility::Private
+                    } else {
+                        Visibility::Public
+                    };
+                    let sig = self.build_c_signature(node, source);
+                    return Some((name, FunctionKind::Function, visibility, false, sig));
+                }
+                None
+            }
+            "struct_specifier" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .unwrap_or_else(|| "anonymous_struct".to_string());
+                let sig = format!("struct {}", name);
+                Some((name, FunctionKind::Struct, Visibility::Public, false, sig))
+            }
+            "class_specifier" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .unwrap_or_else(|| "anonymous_class".to_string());
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, Visibility::Public, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_c_function_name(&self, declarator: Node, source: &[u8]) -> Option<String> {
+        // Handle function_declarator -> declarator -> identifier
+        let mut current = declarator;
+        loop {
+            if current.kind() == "identifier" {
+                return Some(self.node_text(current, source));
+            }
+            if let Some(child) = current.child_by_field_name("declarator") {
+                current = child;
+            } else if let Some(first_child) = current.child(0) {
+                if first_child.kind() == "identifier" {
+                    return Some(self.node_text(first_child, source));
+                }
+                current = first_child;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    fn build_c_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== KOTLIN EXTRACTION ====================
+
+    fn extract_kotlin_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+
+        // Check visibility
+        let visibility = if text.contains("private ") {
+            Visibility::Private
+        } else if text.contains("protected ") {
+            Visibility::Protected
+        } else if text.contains("internal ") {
+            Visibility::Internal
+        } else {
+            Visibility::Public
+        };
+
+        // Check if suspend function (Kotlin async)
+        let is_async = text.contains("suspend ");
+
+        match node_type {
+            "function_declaration" => {
+                let name = self.find_child_by_field(node, "simple_identifier", source)
+                    .or_else(|| self.find_child_by_field(node, "name", source))
+                    .or_else(|| self.extract_kotlin_function_name(node, source))?;
+                let sig = self.build_kotlin_signature(node, source);
+                Some((name, FunctionKind::Function, visibility, is_async, sig))
+            }
+            "class_declaration" => {
+                let name = self.find_child_by_field(node, "simple_identifier", source)
+                    .or_else(|| self.find_child_by_field(node, "name", source))
+                    .or_else(|| self.extract_kotlin_class_name(node, source))?;
+                let kind = if text.contains("data class") {
+                    FunctionKind::Struct
+                } else if text.contains("object ") {
+                    FunctionKind::Class
+                } else {
+                    FunctionKind::Class
+                };
+                let sig = format!("class {}", name);
+                Some((name, kind, visibility, false, sig))
+            }
+            "object_declaration" => {
+                let name = self.find_child_by_field(node, "simple_identifier", source)
+                    .or_else(|| self.extract_kotlin_class_name(node, source))?;
+                let sig = format!("object {}", name);
+                Some((name, FunctionKind::Class, visibility, false, sig))
+            }
+            "companion_object" => {
+                Some(("Companion".to_string(), FunctionKind::Class, visibility, false, "companion object".to_string()))
+            }
+            "secondary_constructor" => {
+                Some(("constructor".to_string(), FunctionKind::Constructor, visibility, false, self.build_kotlin_signature(node, source)))
+            }
+            "property_declaration" => {
+                let name = self.find_child_by_field(node, "simple_identifier", source)
+                    .or_else(|| self.extract_kotlin_property_name(node, source))?;
+                // Check if it's a val/var with getter/setter
+                let kind = if text.contains("get()") || text.contains("set(") {
+                    if text.contains("get()") { FunctionKind::Getter } else { FunctionKind::Setter }
+                } else {
+                    return None; // Skip simple properties
+                };
+                let sig = format!("property {}", name);
+                Some((name, kind, visibility, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_kotlin_function_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "simple_identifier" {
+                return Some(self.node_text(child, source));
+            }
+        }
+        None
+    }
+
+    fn extract_kotlin_class_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "simple_identifier" || child.kind() == "type_identifier" {
+                return Some(self.node_text(child, source));
+            }
+        }
+        None
+    }
+
+    fn extract_kotlin_property_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "variable_declaration" {
+                let mut inner = child.walk();
+                for inner_child in child.children(&mut inner) {
+                    if inner_child.kind() == "simple_identifier" {
+                        return Some(self.node_text(inner_child, source));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn build_kotlin_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else if let Some(eq_pos) = text.find('=') {
+            // Expression body: fun name() = expr
+            text[..eq_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== SWIFT EXTRACTION ====================
+
+    fn extract_swift_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+
+        // Check visibility
+        let visibility = if text.contains("private ") {
+            Visibility::Private
+        } else if text.contains("fileprivate ") {
+            Visibility::Private
+        } else if text.contains("internal ") {
+            Visibility::Internal
+        } else if text.contains("public ") || text.contains("open ") {
+            Visibility::Public
+        } else {
+            Visibility::Internal // Swift default
+        };
+
+        // Check if async function
+        let is_async = text.contains("async ");
+
+        match node_type {
+            "function_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.extract_swift_function_name(node, source))?;
+                let kind = if text.contains("static ") {
+                    FunctionKind::StaticMethod
+                } else if text.contains("class func") {
+                    FunctionKind::ClassMethod
+                } else {
+                    FunctionKind::Function
+                };
+                let sig = self.build_swift_signature(node, source);
+                Some((name, kind, visibility, is_async, sig))
+            }
+            "class_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.extract_swift_type_name(node, source))?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, visibility, false, sig))
+            }
+            "struct_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.extract_swift_type_name(node, source))?;
+                let sig = format!("struct {}", name);
+                Some((name, FunctionKind::Struct, visibility, false, sig))
+            }
+            "protocol_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.extract_swift_type_name(node, source))?;
+                let sig = format!("protocol {}", name);
+                Some((name, FunctionKind::Interface, visibility, false, sig))
+            }
+            "enum_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.extract_swift_type_name(node, source))?;
+                let sig = format!("enum {}", name);
+                Some((name, FunctionKind::Enum, visibility, false, sig))
+            }
+            "initializer_declaration" => {
+                let sig = self.build_swift_signature(node, source);
+                let name = if text.contains("convenience") {
+                    "init(convenience)"
+                } else if text.contains("required") {
+                    "init(required)"
+                } else {
+                    "init"
+                }.to_string();
+                Some((name, FunctionKind::Constructor, visibility, is_async, sig))
+            }
+            "deinitializer_declaration" => {
+                Some(("deinit".to_string(), FunctionKind::Destructor, visibility, false, "deinit".to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_swift_function_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "simple_identifier" || child.kind() == "identifier" {
+                return Some(self.node_text(child, source));
+            }
+        }
+        None
+    }
+
+    fn extract_swift_type_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_identifier" || child.kind() == "simple_identifier" || child.kind() == "identifier" {
+                return Some(self.node_text(child, source));
+            }
+        }
+        None
+    }
+
+    fn build_swift_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        if let Some(brace_pos) = text.find('{') {
+            text[..brace_pos].trim().to_string()
+        } else {
+            text.lines().next().unwrap_or(&text).trim().to_string()
+        }
+    }
+
+    // ==================== PHP EXTRACTION ====================
+
+    fn extract_php_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+        let visibility = self.detect_visibility_from_text(&text, "php");
+
+        match node_type {
+            "function_definition" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Function, visibility, false, sig))
+            }
+            "method_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let is_static = text.contains("static ");
+                let kind = if name == "__construct" {
+                    FunctionKind::Constructor
+                } else if name == "__destruct" {
+                    FunctionKind::Destructor
+                } else if is_static {
+                    FunctionKind::StaticMethod
+                } else {
+                    FunctionKind::Method
+                };
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, kind, visibility, false, sig))
+            }
+            "class_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, Visibility::Public, false, sig))
+            }
+            "interface_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("interface {}", name);
+                Some((name, FunctionKind::Interface, Visibility::Public, false, sig))
+            }
+            "trait_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("trait {}", name);
+                Some((name, FunctionKind::Trait, Visibility::Public, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    // ==================== RUBY EXTRACTION ====================
+
+    fn extract_ruby_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        match node_type {
+            "method" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Method, Visibility::Public, false, sig))
+            }
+            "singleton_method" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::StaticMethod, Visibility::Public, false, sig))
+            }
+            "class" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.find_first_identifier(node, source))?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, Visibility::Public, false, sig))
+            }
+            "module" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.find_first_identifier(node, source))?;
+                let sig = format!("module {}", name);
+                Some((name, FunctionKind::Interface, Visibility::Public, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    // ==================== C# EXTRACTION ====================
+
+    fn extract_csharp_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+        let visibility = self.detect_visibility_from_text(&text, "csharp");
+        let is_async = text.contains("async ");
+        let is_static = text.contains("static ");
+
+        match node_type {
+            "method_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let kind = if is_static { FunctionKind::StaticMethod } else { FunctionKind::Method };
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, kind, visibility, is_async, sig))
+            }
+            "constructor_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Constructor, visibility, false, sig))
+            }
+            "class_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, visibility, false, sig))
+            }
+            "interface_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("interface {}", name);
+                Some((name, FunctionKind::Interface, visibility, false, sig))
+            }
+            "struct_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("struct {}", name);
+                Some((name, FunctionKind::Struct, visibility, false, sig))
+            }
+            "property_declaration" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Getter, visibility, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    // ==================== SCALA EXTRACTION ====================
+
+    fn extract_scala_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        let text = self.node_text(node, source);
+        let visibility = if text.starts_with("private") {
+            Visibility::Private
+        } else if text.starts_with("protected") {
+            Visibility::Protected
+        } else {
+            Visibility::Public
+        };
+
+        match node_type {
+            "function_definition" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Function, visibility, false, sig))
+            }
+            "val_definition" => {
+                let name = self.find_first_identifier(node, source)?;
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Getter, visibility, false, sig))
+            }
+            "class_definition" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.find_first_identifier(node, source))?;
+                let sig = format!("class {}", name);
+                Some((name, FunctionKind::Class, visibility, false, sig))
+            }
+            "object_definition" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.find_first_identifier(node, source))?;
+                let sig = format!("object {}", name);
+                Some((name, FunctionKind::Class, visibility, false, sig))
+            }
+            "trait_definition" => {
+                let name = self.find_child_by_field(node, "name", source)
+                    .or_else(|| self.find_first_identifier(node, source))?;
+                let sig = format!("trait {}", name);
+                Some((name, FunctionKind::Trait, visibility, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    // ==================== BASH EXTRACTION ====================
+
+    fn extract_bash_info(
+        &self,
+        node: Node,
+        source: &[u8],
+        node_type: &str,
+    ) -> Option<(String, FunctionKind, Visibility, bool, String)> {
+        match node_type {
+            "function_definition" => {
+                let name = self.find_child_by_field(node, "name", source)?;
+                let sig = format!("function {}", name);
+                Some((name, FunctionKind::Function, Visibility::Public, false, sig))
+            }
+            "command" => {
+                let name = self.find_first_command_name(node, source)?;
+                if name.starts_with('#') || name.is_empty() {
+                    return None;
+                }
+                let sig = self.build_first_line_signature(node, source);
+                Some((name, FunctionKind::Function, Visibility::Public, false, sig))
+            }
+            _ => None,
+        }
+    }
+
+    // ==================== ADDITIONAL HELPER METHODS ====================
+
+    fn detect_visibility_from_text(&self, text: &str, lang: &str) -> Visibility {
+        let first_line = text.lines().next().unwrap_or("");
+        match lang {
+            "php" | "csharp" | "java" => {
+                if first_line.contains("private") { Visibility::Private }
+                else if first_line.contains("protected") { Visibility::Protected }
+                else if first_line.contains("internal") { Visibility::Internal }
+                else if first_line.contains("public") { Visibility::Public }
+                else { Visibility::Unknown }
+            }
+            _ => Visibility::Public
+        }
+    }
+
+    fn build_first_line_signature(&self, node: Node, source: &[u8]) -> String {
+        let text = self.node_text(node, source);
+        text.lines().next().unwrap_or(&text).trim().to_string()
+    }
+
+    fn find_first_identifier(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind().contains("identifier") || child.kind() == "constant" {
+                return Some(self.node_text(child, source));
+            }
+        }
+        None
+    }
+
+    fn find_first_command_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "command_name" || child.kind() == "word" {
+                return Some(self.node_text(child, source));
+            }
+        }
+        None
+    }
+
+    // ==================== HELPER METHODS ====================
+
+    /// Get text content of a node
+    fn node_text(&self, node: Node, source: &[u8]) -> String {
+        std::str::from_utf8(&source[node.start_byte()..node.end_byte()])
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Find child node by field name and get its text
+    fn find_child_by_field(&self, node: Node, field: &str, source: &[u8]) -> Option<String> {
+        node.child_by_field_name(field)
+            .map(|n| self.node_text(n, source))
+    }
+
+    /// Calculate cyclomatic complexity from AST
+    fn calculate_complexity_ast(&self, node: Node, language: SupportedLanguage) -> usize {
+        let mut complexity = 1; // Base complexity
+
+        let control_flow_types = match language {
+            SupportedLanguage::Rust => vec![
+                "if_expression", "match_expression", "while_expression",
+                "for_expression", "loop_expression", "?",
+            ],
+            SupportedLanguage::Python => vec![
+                "if_statement", "elif_clause", "while_statement",
+                "for_statement", "try_statement", "except_clause",
+                "with_statement", "match_statement",
+            ],
+            SupportedLanguage::JavaScript | SupportedLanguage::TypeScript => vec![
+                "if_statement", "switch_statement", "while_statement",
+                "for_statement", "for_in_statement", "do_statement",
+                "ternary_expression", "catch_clause", "case",
+            ],
+            SupportedLanguage::Java => vec![
+                "if_statement", "switch_expression", "while_statement",
+                "for_statement", "enhanced_for_statement", "do_statement",
+                "ternary_expression", "catch_clause", "case",
+            ],
+            SupportedLanguage::Go => vec![
+                "if_statement", "switch_statement", "for_statement",
+                "select_statement", "case_clause",
+            ],
+            SupportedLanguage::C | SupportedLanguage::Cpp => vec![
+                "if_statement", "switch_statement", "while_statement",
+                "for_statement", "do_statement", "conditional_expression",
+                "case_statement",
+            ],
+            SupportedLanguage::Kotlin => vec![
+                "if_expression", "when_expression", "while_statement",
+                "for_statement", "do_while_statement", "try_expression",
+                "catch_block", "when_entry",
+            ],
+            SupportedLanguage::Swift => vec![
+                "if_statement", "switch_statement", "while_statement",
+                "for_statement", "repeat_while_statement", "do_statement",
+                "catch_clause", "case_item",
+            ],
+            SupportedLanguage::Ruby => vec![
+                "if", "unless", "case", "while", "until",
+                "for", "begin", "rescue", "when",
+            ],
+            SupportedLanguage::CSharp => vec![
+                "if_statement", "switch_statement", "while_statement",
+                "for_statement", "foreach_statement", "do_statement",
+                "catch_clause", "switch_section",
+            ],
+            SupportedLanguage::Scala => vec![
+                "if_expression", "match_expression", "while_expression",
+                "for_expression", "try_expression", "catch_clause",
+                "case_clause",
+            ],
+            SupportedLanguage::Bash => vec![
+                "if_statement", "while_statement", "for_statement",
+                "case_statement", "case_item",
+            ],
+        };
+
+        fn count_control_flow(node: Node, types: &[&str]) -> usize {
+            let mut count = 0;
+            if types.contains(&node.kind()) {
+                count += 1;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                count += count_control_flow(child, types);
+            }
+            count
+        }
+
+        complexity += count_control_flow(node, &control_flow_types);
+        complexity
+    }
+
+    /// Extract docstring/comment before function
+    fn extract_docstring(
+        &self,
+        node: Node,
+        source: &[u8],
+        source_str: &str,
+        start_line: usize,
+    ) -> Option<String> {
+        if start_line <= 1 {
+            return None;
+        }
+
+        let lines: Vec<&str> = source_str.lines().collect();
+        let mut doc_lines = Vec::new();
+
+        // Look at lines before the function
+        for i in (0..start_line - 1).rev() {
+            let line = lines.get(i)?.trim();
+            if line.starts_with("///") || line.starts_with("//!") {
+                doc_lines.insert(0, line.trim_start_matches('/').trim());
+            } else if line.starts_with("#") && !line.starts_with("#[") {
+                doc_lines.insert(0, line.trim_start_matches('#').trim());
+            } else if line.starts_with("\"\"\"") || line.ends_with("\"\"\"") {
+                doc_lines.insert(0, line.trim_matches('"').trim());
+            } else if line.starts_with("/*") || line.starts_with("*") || line.ends_with("*/") {
+                let clean = line.trim_start_matches("/*")
+                    .trim_start_matches("*")
+                    .trim_end_matches("*/")
+                    .trim();
+                if !clean.is_empty() {
+                    doc_lines.insert(0, clean);
+                }
+            } else if !line.is_empty() && !line.starts_with("@") && !line.starts_with("#[") {
+                break;
+            }
+        }
+
+        if doc_lines.is_empty() {
+            None
+        } else {
+            Some(doc_lines.join("\n"))
+        }
+    }
+
+    /// Find nested functions within a function
+    fn find_nested_functions(
+        &self,
+        node: Node,
+        source: &[u8],
+        language: SupportedLanguage,
+    ) -> Vec<String> {
+        let mut nested = Vec::new();
+        let function_types = language.function_node_types();
+
+        fn find_nested_recursive(
+            node: Node,
+            source: &[u8],
+            types: &[&str],
+            nested: &mut Vec<String>,
+            depth: usize,
+            extractor: &TreeSitterExtractor,
+        ) {
+            if depth > 0 && types.contains(&node.kind()) {
+                // This is a nested function
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    nested.push(extractor.node_text(name_node, source));
+                }
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                find_nested_recursive(child, source, types, nested, depth + 1, extractor);
+            }
+        }
+
+        find_nested_recursive(node, source, function_types, &mut nested, 0, self);
+        nested
+    }
+
+    /// Extract function parameters
+    fn extract_parameters(
+        &self,
+        node: Node,
+        source: &[u8],
+        language: SupportedLanguage,
+    ) -> Vec<Parameter> {
+        let mut params = Vec::new();
+
+        // Find parameters node
+        let params_node = node.child_by_field_name("parameters")
+            .or_else(|| node.child_by_field_name("formal_parameters"));
+
+        if let Some(pn) = params_node {
+            let mut cursor = pn.walk();
+            for child in pn.children(&mut cursor) {
+                match child.kind() {
+                    "parameter" | "formal_parameter" | "required_parameter" |
+                    "optional_parameter" | "typed_parameter" | "default_parameter" => {
+                        let name = child.child_by_field_name("name")
+                            .or_else(|| child.child_by_field_name("pattern"))
+                            .map(|n| self.node_text(n, source))
+                            .unwrap_or_else(|| self.node_text(child, source));
+
+                        let param_type = child.child_by_field_name("type")
+                            .map(|n| self.node_text(n, source));
+
+                        let default_value = child.child_by_field_name("value")
+                            .or_else(|| child.child_by_field_name("default_value"))
+                            .map(|n| self.node_text(n, source));
+
+                        let is_variadic = child.kind().contains("rest") ||
+                            self.node_text(child, source).contains("...");
+
+                        params.push(Parameter {
+                            name,
+                            param_type,
+                            default_value,
+                            is_variadic,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        params
+    }
+
+    /// Extract return type
+    fn extract_return_type(
+        &self,
+        node: Node,
+        source: &[u8],
+        language: SupportedLanguage,
+    ) -> Option<String> {
+        // Try different field names for return type
+        node.child_by_field_name("return_type")
+            .or_else(|| node.child_by_field_name("result"))
+            .or_else(|| node.child_by_field_name("type"))
+            .map(|n| self.node_text(n, source))
+    }
+}
+
+impl Default for TreeSitterExtractor {
+    fn default() -> Self {
+        Self::new().expect("Failed to create TreeSitterExtractor")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_python_extraction() {
+        let mut extractor = TreeSitterExtractor::new().unwrap();
+        let source = r#"
+def hello(name: str) -> str:
+    """Say hello to someone."""
+    return f"Hello, {name}!"
+
+async def fetch_data(url: str):
+    async with session.get(url) as resp:
+        return await resp.json()
+
+class MyClass:
+    def __init__(self):
+        self.value = 0
+
+    def increment(self):
+        self.value += 1
+"#;
+
+        let functions = extractor.extract_functions(source, "test.py", SupportedLanguage::Python).unwrap();
+        assert!(functions.len() >= 3);
+        assert!(functions.iter().any(|f| f.name == "hello"));
+        assert!(functions.iter().any(|f| f.name == "fetch_data" && f.is_async));
+        assert!(functions.iter().any(|f| f.name == "MyClass"));
+    }
+
+    #[test]
+    fn test_rust_extraction() {
+        let mut extractor = TreeSitterExtractor::new().unwrap();
+        let source = r#"
+pub fn process_data(input: &str) -> Result<String, Error> {
+    let result = input.trim();
+    Ok(result.to_string())
+}
+
+impl MyStruct {
+    pub async fn fetch(&self) -> Vec<u8> {
+        vec![]
+    }
+}
+
+struct Config {
+    name: String,
+    value: i32,
+}
+"#;
+
+        let functions = extractor.extract_functions(source, "test.rs", SupportedLanguage::Rust).unwrap();
+        assert!(functions.len() >= 2);
+        assert!(functions.iter().any(|f| f.name == "process_data"));
+    }
+
+    #[test]
+    fn test_javascript_extraction() {
+        let mut extractor = TreeSitterExtractor::new().unwrap();
+        let source = r#"
+function greet(name) {
+    return `Hello, ${name}!`;
+}
+
+const fetchUser = async (id) => {
+    const response = await fetch(`/api/users/${id}`);
+    return response.json();
+};
+
+class UserService {
+    constructor() {
+        this.users = [];
+    }
+
+    static getInstance() {
+        return new UserService();
+    }
+
+    async getUser(id) {
+        return this.users.find(u => u.id === id);
+    }
+}
+"#;
+
+        let functions = extractor.extract_functions(source, "test.js", SupportedLanguage::JavaScript).unwrap();
+        assert!(functions.len() >= 3);
+        assert!(functions.iter().any(|f| f.name == "greet"));
+        assert!(functions.iter().any(|f| f.name == "UserService"));
+    }
+
+    #[test]
+    fn test_kotlin_extraction() {
+        let mut extractor = TreeSitterExtractor::new().unwrap();
+        let source = r#"
+package com.example
+
+fun calculatePrice(items: List<Item>, discount: Double = 0.0): Double {
+    return items.sumOf { it.price } * (1 - discount)
+}
+
+class OrderService(private val repository: OrderRepository) {
+
+    suspend fun createOrder(userId: String, items: List<Item>): Order {
+        val order = Order(userId = userId, items = items)
+        return repository.save(order)
+    }
+
+    fun getOrders(userId: String): List<Order> {
+        return repository.findByUserId(userId)
+    }
+}
+
+data class Order(
+    val id: String = UUID.randomUUID().toString(),
+    val userId: String,
+    val items: List<Item>
+)
+
+object Logger {
+    fun log(message: String) {
+        println("[LOG] $message")
+    }
+}
+"#;
+
+        let functions = extractor.extract_functions(source, "test.kt", SupportedLanguage::Kotlin).unwrap();
+        assert!(functions.len() >= 3, "Expected at least 3 functions, got {}", functions.len());
+        assert!(functions.iter().any(|f| f.name == "calculatePrice"), "Missing calculatePrice");
+        assert!(functions.iter().any(|f| f.name == "OrderService" || f.name == "createOrder" || f.name == "getOrders"),
+                "Missing OrderService methods");
+    }
+
+    #[test]
+    fn test_swift_extraction() {
+        let mut extractor = TreeSitterExtractor::new().unwrap();
+        let source = r#"
+import Foundation
+
+func fetchData(from url: URL, completion: @escaping (Result<Data, Error>) -> Void) {
+    URLSession.shared.dataTask(with: url) { data, response, error in
+        if let error = error {
+            completion(.failure(error))
+        } else if let data = data {
+            completion(.success(data))
+        }
+    }.resume()
+}
+
+class UserManager {
+    private var users: [User] = []
+
+    init() {
+        loadUsers()
+    }
+
+    func addUser(_ user: User) {
+        users.append(user)
+    }
+
+    func findUser(byId id: String) -> User? {
+        return users.first { $0.id == id }
+    }
+}
+
+struct User: Codable {
+    let id: String
+    let name: String
+    let email: String
+}
+
+protocol DataService {
+    func fetch() async throws -> Data
+}
+
+enum NetworkError: Error {
+    case invalidURL
+    case noData
+    case decodingFailed
+}
+"#;
+
+        let functions = extractor.extract_functions(source, "test.swift", SupportedLanguage::Swift).unwrap();
+        assert!(functions.len() >= 3, "Expected at least 3 functions, got {}", functions.len());
+        assert!(functions.iter().any(|f| f.name == "fetchData"), "Missing fetchData");
+        assert!(functions.iter().any(|f| f.name == "UserManager" || f.name == "addUser"),
+                "Missing UserManager or addUser");
+    }
+}

@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+/node_modules/
+
+# Archive (local cleanup)
+/archive/
+
+# IDE
+/.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+*.txt.backup*
+lft_index_output.txt
+
+# Dev databases
+*.db
+*.sqlite

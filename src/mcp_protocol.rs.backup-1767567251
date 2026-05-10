@@ -1,0 +1,2407 @@
+//! MCP Protocol Handler - Model Context Protocol implementation
+//!
+//! Implementation of MCP (Model Context Protocol) for Live Function Tree:
+//! - JSON-RPC 2.0 protocol handling
+//! - Tool registration and execution
+//! - Request/response validation
+//! - Error handling and logging
+//! - Asynchronous processing
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use anyhow::{Result, anyhow};
+use log::{info, debug, error, warn};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use live_function_tree_mcp_rust::simple_cfg_analyzer::{SimpleCfgAnalyzer, Severity};
+use live_function_tree_mcp_rust::tree_sitter_extractor::{TreeSitterExtractor, SupportedLanguage};
+
+/// MCP Protocol version
+pub const MCP_VERSION: &str = "2024-11-05";
+
+/// Tool definition for MCP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTool {
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+}
+
+/// Tool execution result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub content: Vec<ToolContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+}
+
+/// Tool content types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+}
+
+/// JSON-RPC request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: String,
+    pub id: Option<Value>,
+    pub method: String,
+    pub params: Option<Value>,
+}
+
+/// JSON-RPC response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    pub id: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+}
+
+/// JSON-RPC error
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// Initialization parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_info: Option<Value>,
+}
+
+use crate::{
+    psi_graph::PsiGraphManager,
+    function_extractor::FunctionExtractor,
+    file_watcher::FileWatcher,
+    hierarchical_tree::HierarchicalTreeBuilder,
+};
+
+use live_function_tree_mcp_rust::db_maintenance;
+
+
+/// MCP Protocol handler
+pub struct McpProtocolHandler {
+    psi_manager: PsiGraphManager,
+    extractor: FunctionExtractor,
+    file_watcher: Option<FileWatcher>,
+    hierarchical_builder: HierarchicalTreeBuilder,
+}
+
+impl McpProtocolHandler {
+    /// Create new protocol handler
+    pub async fn new() -> Result<Self> {
+        let psi_manager = PsiGraphManager::new().await?;
+
+        // Pre-load ALL functions into memory cache for instant queries
+        info!("🚀 Pre-loading function cache into RAM...");
+        match psi_manager.load_into_memory_cache().await {
+            Ok(count) => info!("✅ Loaded {} functions into memory cache", count),
+            Err(e) => info!("⚠️ Cache pre-load skipped: {}", e),
+        }
+
+        Ok(Self {
+            psi_manager,
+            extractor: FunctionExtractor::new(),
+            file_watcher: None,
+            hierarchical_builder: HierarchicalTreeBuilder::new().await?,
+        })
+    }
+
+    /// Register all available tools
+    pub fn register_tools(&self) -> HashMap<String, McpTool> {
+        let mut tools = HashMap::new();
+
+        // lft_snapshot_project - One-shot snapshot: index (optional) + stats/tree/imports/call-graph in one call
+        tools.insert("lft_snapshot_project".to_string(), McpTool {
+            name: "lft_snapshot_project".to_string(),
+            description: "One-shot project snapshot: optionally index (or ensure indexed) then return a manifest with stats, hierarchical tree, imports, and call graph. Designed for 'one tools/call and you understand the system' workflows on Windows.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Project root. If provided and reindex/ensure_indexed is enabled, indexing will run before snapshot."
+                    },
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repo id to use. If omitted and project_path is provided, server auto-derives it."
+                    },
+                    "ensure_indexed": {
+                        "type": "boolean",
+                        "description": "If true, indexes the project when needed (default: true).",
+                        "default": true
+                    },
+                    "reindex": {
+                        "type": "string",
+                        "description": "Indexing mode when ensure_indexed is true.",
+                        "enum": ["none", "incremental", "full"],
+                        "default": "incremental"
+                    },
+                    "languages": {
+                        "type": "array",
+                        "description": "Optional language filter. If omitted -> FULL SCAN policy (no language filtering).",
+                        "items": {"type": "string"}
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "description": "Include test files in analysis (only applies to indexing).",
+                        "default": true
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Maximum files to process (only applies to indexing).",
+                        "default": 1000
+                    },
+                    "tree": {
+                        "type": "object",
+                        "description": "Options for lft_get_hierarchical_tree",
+                        "properties": {
+                            "include_context": {"type": "boolean", "default": true},
+                            "context_lines": {"type": "integer", "default": 2},
+                            "include_cross_refs": {"type": "boolean", "default": true},
+                            "output_format": {"type": "string", "enum": ["json", "json-compressed", "bincode"], "default": "json"}
+                        }
+                    },
+                    "call_graph": {
+                        "type": "object",
+                        "description": "Options for lft_get_call_graph",
+                        "properties": {
+                            "depth": {"type": "integer", "default": 2},
+                            "direction": {"type": "string", "enum": ["callers", "callees", "both"], "default": "both"},
+                            "include_external": {"type": "boolean", "default": false}
+                        }
+                    }
+                },
+                "required": []
+            }),
+        });
+
+        // lft_llm_pack_project - One-shot snapshot -> compact report (LLM-friendly)
+        tools.insert("lft_llm_pack_project".to_string(), McpTool {
+            name: "lft_llm_pack_project".to_string(),
+            description: "One-shot snapshot + compact report. Returns a small text report derived from stats/tree/imports/call_graph (no huge JSON dump). Optionally embeds a compressed snapshot payload wrapper for offline decoding.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {"type": "string", "description": "Project root directory"},
+                    "repo_id": {"type": "string", "description": "Optional repo_id override"},
+                    "ensure_indexed": {"type": "boolean", "default": true},
+                    "reindex": {"type": "string", "enum": ["none", "incremental", "full"], "default": "incremental"},
+                    "languages": {"type": "array", "items": {"type": "string"}, "description": "Optional language filter. When omitted => FULL SCAN."},
+                    "include_tests": {"type": "boolean", "default": true},
+                    "max_files": {"type": "integer", "default": 1000},
+                    "tree": {"type": "object", "description": "Same as lft_snapshot_project.tree"},
+                    "call_graph": {"type": "object", "description": "Same as lft_snapshot_project.call_graph"},
+
+                    "include_snapshot_payload": {"type": "boolean", "default": false, "description": "If true, embeds compressed snapshot payload wrapper"},
+                    "snapshot_payload_format": {"type": "string", "enum": ["json-compressed", "bincode"], "default": "json-compressed"}
+                },
+                "required": ["project_path"]
+            }),
+        });
+
+        // lft_index_project - Index project for ultra-fast function tree generation
+        tools.insert("lft_index_project".to_string(), McpTool {
+            name: "lft_index_project".to_string(),
+            description: "Index a project for ultra-fast function tree generation".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project root directory"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Indexing mode: 'incremental' (default - only changed files), 'replace' (clear old index and rebuild)",
+                        "enum": ["incremental", "replace"],
+                        "default": "incremental"
+                    },
+                    "languages": {
+                        "type": "array",
+                        "description": "Programming languages to analyze",
+                        "items": {"type": "string"}
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "description": "Include test files in analysis",
+                        "default": true
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Maximum number of files to process",
+                        "default": 1000
+                    }
+                },
+                "required": ["project_path"]
+            }),
+        });
+
+        // lft_index_incremental - Incremental indexing for ultra-fast updates (RECOMMENDED)
+        tools.insert("lft_index_incremental".to_string(), McpTool {
+            name: "lft_index_incremental".to_string(),
+            description: "INCREMENTAL indexing - only processes changed files for maximum speed (RECOMMENDED)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project root directory"
+                    },
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Unique identifier for this project"
+                    },
+                    "languages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Programming languages to analyze"
+                    },
+                    "force_full_reindex": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Force full reindex instead of incremental"
+                    }
+                },
+                "required": ["project_path"]
+            }),
+        });
+
+        // lft_query_functions - Query indexed functions with filtering and search
+        tools.insert("lft_query_functions".to_string(), McpTool {
+            name: "lft_query_functions".to_string(),
+            description: "Query indexed functions with filtering and search".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier from lft_index_project"
+                    },
+                    "query_type": {
+                        "type": "string",
+                        "description": "Type of query to perform",
+                        "enum": ["symbol_usages", "dependencies", "callers", "callees", "imports", "dead_code"]
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name to search for"
+                    },
+                    "include_context": {
+                        "type": "boolean",
+                        "description": "Include code context around matches",
+                        "default": true
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return",
+                        "default": 100
+                    }
+                },
+                "required": ["repo_id", "query_type"]
+            }),
+        });
+
+        // lft_get_hierarchical_tree - Get hierarchical function tree with smart junk filtering
+        tools.insert("lft_get_hierarchical_tree".to_string(), McpTool {
+            name: "lft_get_hierarchical_tree".to_string(),
+            description: "Get hierarchical function tree with smart junk filtering. Use project_path (preferred) or repo_id (legacy).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project root directory (PREFERRED - auto-detects repo_id)"
+                    },
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier (LEGACY - use project_path instead)"
+                    },
+                    "apply_filtering": {
+                        "type": "boolean",
+                        "description": "Apply smart junk filtering",
+                        "default": true
+                    },
+                    "min_complexity": {
+                        "type": "integer",
+                        "description": "Minimum function complexity to include",
+                        "default": 1
+                    },
+                    "include_private": {
+                        "type": "boolean",
+                        "description": "Include private functions",
+                        "default": false
+                    },
+                    "group_by_file": {
+                        "type": "boolean",
+                        "description": "Group functions by file",
+                        "default": true
+                    },
+                    "include_context": {
+                        "type": "boolean",
+                        "description": "Include code context before/after functions",
+                        "default": true
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Number of context lines before/after functions",
+                        "default": 5
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Output format: 'json' (default), 'json-compressed' (gzip), 'bincode' (binary)",
+                        "enum": ["json", "json-compressed", "bincode"],
+                        "default": "json"
+                    },
+                    "include_cross_refs": {
+                        "type": "boolean",
+                        "description": "Include cross-file function relationships",
+                        "default": true
+                    }
+                },
+                "required": []
+            }),
+        });
+
+        // lft_get_stats - Get comprehensive project statistics and health metrics
+        tools.insert("lft_get_stats".to_string(), McpTool {
+            name: "lft_get_stats".to_string(),
+            description: "Get comprehensive project statistics and health metrics".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier from lft_index_project"
+                    }
+                },
+                "required": ["repo_id"]
+            }),
+        });
+
+                // lft_start_watch - Start real-time file watching for automatic reindexing
+        tools.insert("lft_start_watch".to_string(), McpTool {
+            name: "lft_start_watch".to_string(),
+            description: "Start real-time file watching for automatic reindexing when files change".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier from lft_index_project"
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project directory to watch"
+                    }
+                },
+                "required": ["repo_id", "project_path"]
+            }),
+        });
+
+        // lft_clear_repository - Clear all data for specific repository
+        tools.insert("lft_clear_repository".to_string(), McpTool {
+            name: "lft_clear_repository".to_string(),
+            description: "Clear all indexed data for specific repository to prevent data accumulation".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier to clear"
+                    }
+                },
+                "required": ["repo_id"]
+            }),
+        });
+
+        // lft_list_repositories - List all repositories in database with stats
+        tools.insert("lft_list_repositories".to_string(), McpTool {
+            name: "lft_list_repositories".to_string(),
+            description: "List all repositories in database with statistics and metadata".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+
+        // lft_cleanup_old - Cleanup old/duplicate repositories
+        tools.insert("lft_cleanup_old".to_string(), McpTool {
+            name: "lft_cleanup_old".to_string(),
+            description: "Cleanup old repository data keeping only latest N entries per project path".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "keep_latest": {
+                        "type": "number",
+                        "description": "Number of latest entries to keep per project path",
+                        "default": 2
+                    }
+                },
+                "required": []
+            }),
+        });
+
+        // lft_database_stats - Get database statistics and health
+        tools.insert("lft_database_stats".to_string(), McpTool {
+            name: "lft_database_stats".to_string(),
+            description: "Get comprehensive database statistics, size, and health metrics".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+
+        // lft_optimize_database - Vacuum and optimize database
+        tools.insert("lft_optimize_database".to_string(), McpTool {
+            name: "lft_optimize_database".to_string(),
+            description: "Optimize database by running VACUUM and ANALYZE for better performance".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+
+        // lft_clear_db - Clear MCP SQLite database (full wipe or per repo_id)
+        tools.insert("lft_clear_db".to_string(), McpTool {
+            name: "lft_clear_db".to_string(),
+            description: "Clear MCP SQLite database (projects + functions). Supports full wipe or scoped by repo_id. Safe defaults: backup enabled, dry-run available.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "If provided, clears only this repository (DELETE FROM functions/projects WHERE repo_id=...)."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, does not modify DB - returns counts only.",
+                        "default": false
+                    },
+                    "no_backup": {
+                        "type": "boolean",
+                        "description": "If true, skips creating a timestamped .db backup.",
+                        "default": false
+                    },
+                    "vacuum": {
+                        "type": "boolean",
+                        "description": "If set, forces VACUUM behavior (default: true for full wipe, false for repo-only)."
+                    }
+                },
+                "required": []
+            }),
+        });
+
+        // lft_search_functions - Search functions by name/pattern
+        tools.insert("lft_search_functions".to_string(), McpTool {
+            name: "lft_search_functions".to_string(),
+            description: "Search functions by name pattern with regex support. Returns matching functions with context.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier from lft_index_project"
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Search pattern (regex or simple text)"
+                    },
+                    "is_regex": {
+                        "type": "boolean",
+                        "description": "Whether pattern is regex",
+                        "default": false
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Filter by programming language (optional)"
+                    },
+                    "include_body": {
+                        "type": "boolean",
+                        "description": "Include full function body code",
+                        "default": false
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Number of context lines around function",
+                        "default": 3
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results",
+                        "default": 50
+                    }
+                },
+                "required": ["repo_id", "pattern"]
+            }),
+        });
+
+        // lft_get_file_functions - Get all functions from a specific file
+        tools.insert("lft_get_file_functions".to_string(), McpTool {
+            name: "lft_get_file_functions".to_string(),
+            description: "Get all functions from a specific file with optional body and context.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier from lft_index_project"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to file (relative to project root)"
+                    },
+                    "include_body": {
+                        "type": "boolean",
+                        "description": "Include full function body code",
+                        "default": true
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Number of context lines around function",
+                        "default": 5
+                    }
+                },
+                "required": ["repo_id", "file_path"]
+            }),
+        });
+
+        // lft_get_function_details - Get detailed info about specific function
+        tools.insert("lft_get_function_details".to_string(), McpTool {
+            name: "lft_get_function_details".to_string(),
+            description: "Get full details of a specific function including body, context, complexity, and callers/callees.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier"
+                    },
+                    "function_name": {
+                        "type": "string",
+                        "description": "Name of the function to get details for"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "File path (optional, helps disambiguate)"
+                    },
+                    "include_callers": {
+                        "type": "boolean",
+                        "description": "Include functions that call this function",
+                        "default": true
+                    },
+                    "include_callees": {
+                        "type": "boolean",
+                        "description": "Include functions called by this function",
+                        "default": true
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Context lines around function",
+                        "default": 10
+                    }
+                },
+                "required": ["repo_id", "function_name"]
+            }),
+        });
+
+        // lft_get_imports - Get imports/dependencies for file or function
+        tools.insert("lft_get_imports".to_string(), McpTool {
+            name: "lft_get_imports".to_string(),
+            description: "Get imports and dependencies for a file or the entire project.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Specific file to analyze (optional, analyzes all if not provided)"
+                    },
+                    "include_external": {
+                        "type": "boolean",
+                        "description": "Include external/third-party imports",
+                        "default": true
+                    },
+                    "group_by_file": {
+                        "type": "boolean",
+                        "description": "Group imports by file",
+                        "default": true
+                    }
+                },
+                "required": ["repo_id"]
+            }),
+        });
+
+        // lft_get_call_graph - Get call graph for project or function
+        tools.insert("lft_get_call_graph".to_string(), McpTool {
+            name: "lft_get_call_graph".to_string(),
+            description: "Get call graph showing function relationships - who calls whom.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier"
+                    },
+                    "function_name": {
+                        "type": "string",
+                        "description": "Specific function to analyze (optional, analyzes all if not provided)"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Maximum depth of call graph traversal",
+                        "default": 3
+                    },
+                    "direction": {
+                        "type": "string",
+                        "description": "Direction: 'callers', 'callees', or 'both'",
+                        "enum": ["callers", "callees", "both"],
+                        "default": "both"
+                    },
+                    "include_external": {
+                        "type": "boolean",
+                        "description": "Include calls to external/stdlib functions",
+                        "default": false
+                    }
+                },
+                "required": ["repo_id"]
+            }),
+        });
+
+        // lft_analyze_cfg - Analyze control flow graph for function or file
+        tools.insert("lft_analyze_cfg".to_string(), McpTool {
+            name: "lft_analyze_cfg".to_string(),
+            description: "Analyze control flow graph (CFG) for a specific function or all functions in a file. Detects unreachable code after return/panic/throw statements.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to source file to analyze"
+                    },
+                    "function_name": {
+                        "type": "string",
+                        "description": "Specific function name (optional - analyzes all functions in file if not provided)"
+                    },
+                    "include_context": {
+                        "type": "boolean",
+                        "description": "Include code context around unreachable blocks",
+                        "default": true
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Number of context lines around unreachable code",
+                        "default": 3
+                    }
+                },
+                "required": ["file_path"]
+            }),
+        });
+
+        // lft_detect_unreachable - Scan entire project for unreachable code
+        tools.insert("lft_detect_unreachable".to_string(), McpTool {
+            name: "lft_detect_unreachable".to_string(),
+            description: "Scan entire project or repository for unreachable code (code after return/panic/throw). Returns summary with all functions containing unreachable code.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "Repository identifier (use lft_index_project first)"
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Project path (alternative to repo_id - will auto-detect)"
+                    },
+                    "severity_filter": {
+                        "type": "string",
+                        "description": "Filter by severity level",
+                        "enum": ["High", "Medium", "Low"],
+                        "default": "Medium"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of issues to return",
+                        "default": 100
+                    },
+                    "include_context": {
+                        "type": "boolean",
+                        "description": "Include code context for each issue",
+                        "default": true
+                    }
+                },
+                "required": []
+            }),
+        });
+        // === SEMANTIC SEARCH TOOLS ===
+        info!("🔧 Adding 3 semantic search tools");
+
+        // lft_search_semantic - Semantic code search with natural language
+        tools.insert("lft_search_semantic".to_string(), McpTool {
+            name: "lft_search_semantic".to_string(),
+            description: "Search code using natural language queries and semantic understanding. Find functions, classes, and patterns based on intent and behavior.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project root directory"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query (e.g., 'find authentication functions', 'locate error handling code')"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return",
+                        "default": 10
+                    },
+                    "include_context": {
+                        "type": "boolean",
+                        "description": "Include surrounding code context",
+                        "default": true
+                    }
+                },
+                "required": ["project_path", "query"]
+            }),
+        });
+
+        // lft_analyze_code_intent - Analyze code intent and categorize functions
+        tools.insert("lft_analyze_code_intent".to_string(), McpTool {
+            name: "lft_analyze_code_intent".to_string(),
+            description: "Analyze code intent and categorize functions by their purpose (authentication, validation, data processing, etc.). Provides semantic understanding of code structure.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project root directory"
+                    },
+                    "category_filter": {
+                        "type": "array",
+                        "description": "Filter by specific categories (optional)",
+                        "items": {
+                            "type": "string",
+                            "enum": ["authentication", "validation", "data_processing", "api_endpoint", "utility", "configuration", "error_handling"]
+                        }
+                    },
+                    "confidence_threshold": {
+                        "type": "number",
+                        "description": "Minimum confidence score (0.0-1.0)",
+                        "default": 0.7
+                    }
+                },
+                "required": ["project_path"]
+            }),
+        });
+
+        // lft_search_behavioral - Search by behavioral patterns and code characteristics
+        tools.insert("lft_search_behavioral".to_string(), McpTool {
+            name: "lft_search_behavioral".to_string(),
+            description: "Search for functions based on behavioral patterns: async/await usage, error handling patterns, database interactions, API calls, complex logic, etc.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to project root directory"
+                    },
+                    "pattern_type": {
+                        "type": "string",
+                        "description": "Type of behavioral pattern to search for",
+                        "enum": ["async_await", "database_queries", "api_calls", "error_handling", "complex_logic", "recursive_functions", "event_handlers"]
+                    },
+                    "complexity_min": {
+                        "type": "integer",
+                        "description": "Minimum complexity threshold",
+                        "default": 1
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return",
+                        "default": 20
+                    }
+                },
+                "required": ["project_path", "pattern_type"]
+            }),
+        });
+
+        tools
+    }
+
+    /// Get server info
+    pub fn get_server_info(&self) -> Value {
+        json!({
+            "name": "live-function-tree-mcp",
+            "version": "0.1.0",
+            "protocolVersion": MCP_VERSION,
+            "protocol_version": MCP_VERSION  // Keep both for compatibility
+        })
+    }
+
+    /// Process MCP request
+    pub async fn process_request(&mut self, method: &str, request: &JsonRpcRequest) -> Result<Value> {
+        debug!("🔄 Processing request: {}", method);
+
+        match method {
+            "tools/list" => self.handle_list_tools().await,
+            "tools/call" => self.handle_tool_call(&request).await,
+            "notifications/initialized" => self.handle_initialized().await,
+            _ => Err(anyhow!("Unsupported method: {}", method))
+        }
+    }
+
+    /// Initialize protocol
+    pub async fn initialize(&mut self, _params: Option<Value>) -> Result<Value> {
+        info!("🚀 Initializing Live Function Tree MCP Server");
+
+        Ok(json!({
+            "protocolVersion": MCP_VERSION,
+            "protocol_version": MCP_VERSION,  // Keep both for compatibility
+            "capabilities": {
+                "tools": {
+                    "listChanged": false,
+                    "list_changed": false  // Keep both for compatibility
+                }
+            },
+            "serverInfo": self.get_server_info(),
+            "server_info": self.get_server_info()  // Keep both for compatibility
+        }))
+    }
+
+    /// Handle notifications/initialized
+    async fn handle_initialized(&self) -> Result<Value> {
+        debug!("✅ Client initialization completed");
+        // This is a notification, so we don't need to return anything meaningful
+        // Just acknowledge that we received the initialized notification
+        Ok(json!(null))
+    }
+
+    /// Handle list tools request
+    async fn handle_list_tools(&self) -> Result<Value> {
+        let tools = self.register_tools();
+        info!(
+            "🔧 RooCode requested tools/list - returning {} tools",
+            tools.len()
+        );
+        let tools_array: Vec<Value> = tools.into_values()
+            .map(|tool| json!(tool))
+            .collect();
+
+        info!("📦 Tools being sent to RooCode: {:?}", tools_array.iter().map(|t| t.get("name")).collect::<Vec<_>>());
+
+        Ok(json!({ "tools": tools_array }))
+    }
+
+    /// Handle tool call
+    async fn handle_tool_call(&mut self, request: &JsonRpcRequest) -> Result<Value> {
+        let params = request.params.as_ref()
+            .ok_or_else(|| anyhow!("Missing parameters for tool call"))?;
+
+        let arguments = params.get("arguments")
+            .ok_or_else(|| anyhow!("Missing arguments"));
+        let name = params.get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| anyhow!("Missing tool name"))?;
+
+        debug!("🛠️ Executing tool: {}", name);
+
+        let result = match name {
+            "lft_snapshot_project" => self.handle_snapshot_project(arguments?).await,
+            "lft_index_project" => self.handle_index_project(arguments?).await,
+            "lft_index_incremental" => self.handle_index_incremental(arguments?).await,
+            "lft_query_functions" => self.handle_query_functions(arguments?).await,
+            "lft_get_hierarchical_tree" => self.handle_get_hierarchical_tree(arguments?).await,
+            "lft_llm_pack_project" => self.handle_llm_pack_project(arguments?).await,
+            "lft_get_stats" => self.handle_get_stats(arguments?).await,
+            "lft_start_watch" => self.handle_start_watch(arguments?).await,
+            "lft_clear_repository" => self.handle_clear_repository(arguments?).await,
+            "lft_list_repositories" => self.handle_list_repositories(arguments?).await,
+            "lft_cleanup_old" => self.handle_cleanup_old(arguments?).await,
+            "lft_database_stats" => self.handle_database_stats(arguments?).await,
+            "lft_optimize_database" => self.handle_optimize_database(arguments?).await,
+            "lft_clear_db" => self.handle_clear_db(arguments?).await,
+            "lft_search_functions" => self.handle_search_functions(arguments?).await,
+            "lft_get_file_functions" => self.handle_get_file_functions(arguments?).await,
+            "lft_get_function_details" => self.handle_get_function_details(arguments?).await,
+            "lft_get_imports" => self.handle_get_imports(arguments?).await,
+            "lft_get_call_graph" => self.handle_get_call_graph(arguments?).await,
+            "lft_analyze_cfg" => self.handle_analyze_cfg(arguments?).await,
+            "lft_detect_unreachable" => self.handle_detect_unreachable(arguments?).await,
+            _ => return Err(anyhow!("Unknown tool: {}", name))
+        };
+
+        match result {
+            Ok(content) => Ok(json!({
+                "content": [{"type": "text", "text": content}],
+                "is_error": false
+            })),
+            Err(e) => Ok(json!({
+                "content": [{"type": "text", "text": format!("Error: {}", e)}],
+                "is_error": true
+            }))
+        }
+    }
+
+    /// One-shot snapshot: index/ensure indexed then return manifest JSON.
+    ///
+    /// NOTE:
+    /// - We return a JSON string (ToolContent::text) because the current MCP wrapper expects text.
+    /// - Clients should parse the returned JSON string.
+    async fn handle_snapshot_project(&mut self, args: &Value) -> Result<String> {
+        // Opcja dla klienta/LLM: całe wyjście tego toola może być skompresowane.
+        // Domyślnie zachowujemy "json" (wsteczna kompatybilność), ale można wymusić:
+        // - json-compressed: gzip(JSON) + base64
+        // - bincode: bincode(manifest) + base64
+        let manifest_output_format = args
+            .get("output_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("json");
+
+        let ensure_indexed = args
+            .get("ensure_indexed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let reindex_mode = args
+            .get("reindex")
+            .and_then(|v| v.as_str())
+            .unwrap_or("incremental");
+
+        let project_path_opt = args.get("project_path").and_then(|p| p.as_str()).map(|s| s.to_string());
+
+        // repo_id selection priority:
+        // 1) explicit repo_id
+        // 2) derived from project_path
+        // 3) error
+        let repo_id = if let Some(id) = args.get("repo_id").and_then(|r| r.as_str()) {
+            id.to_string()
+        } else if let Some(ref project_path) = project_path_opt {
+            self.psi_manager.get_or_create_repo_id(project_path).await?
+        } else {
+            return Err(anyhow!("Missing repo_id or project_path"));
+        };
+
+        // Optional languages: FULL SCAN when omitted.
+        let languages: Option<Vec<String>> = args
+            .get("languages")
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            });
+
+        let include_tests = args.get("include_tests").and_then(|t| t.as_bool()).unwrap_or(true);
+        let max_files = args.get("max_files").and_then(|m| m.as_u64()).unwrap_or(1000) as usize;
+
+        // Ensure indexed if requested.
+        let mut indexing_result: Option<Value> = None;
+        if ensure_indexed {
+            let project_path = project_path_opt.clone().ok_or_else(|| anyhow!(
+                "ensure_indexed=true requires project_path (repo_id alone has no file roots)"
+            ))?;
+
+            // If repo exists already and reindex_mode is "none", skip.
+            // Otherwise, run incremental/full.
+            let should_index = match reindex_mode {
+                "none" => {
+                    // Validate it exists, otherwise fail with guidance.
+                    let exists = self.psi_manager.get_repository_stats(&repo_id).await.is_ok();
+                    if !exists {
+                        return Err(anyhow!(
+                            "Repo '{}' not indexed yet. Either set reindex=incremental/full or run lft_index_project first.",
+                            repo_id
+                        ));
+                    }
+                    false
+                }
+                _ => true,
+            };
+
+            if should_index {
+                let lang_refs: Option<Vec<&str>> = languages
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+                // We intentionally do NOT change the global behavior of lft_index_project here.
+                // Snapshot tool decides whether to run incremental or full.
+                let force_full_reindex = matches!(reindex_mode, "full");
+
+                // NOTE: include_tests/max_files are currently not wired into the incremental indexer
+                // signature; they are kept for forward compatibility and future enforcement.
+                let _ = (include_tests, max_files);
+
+                let idx = self
+                    .psi_manager
+                    .index_project_incremental(
+                        &project_path,
+                        &repo_id,
+                        lang_refs.as_ref().map(|v| v.as_slice()),
+                        force_full_reindex,
+                    )
+                    .await?;
+
+                self.psi_manager.warm_cache_if_enabled().await?;
+
+                indexing_result = Some(serde_json::to_value(idx)?);
+            }
+        }
+
+        // Collect snapshot pieces.
+        let stats = self.psi_manager.get_repository_stats(&repo_id).await?;
+
+        let tree_opts = args.get("tree");
+        let tree_include_context = tree_opts
+            .and_then(|t| t.get("include_context"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let tree_context_lines = tree_opts
+            .and_then(|t| t.get("context_lines"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize;
+        let tree_output_format = tree_opts
+            .and_then(|t| t.get("output_format"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("json");
+        let tree_include_cross_refs = tree_opts
+            .and_then(|t| t.get("include_cross_refs"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let tree = self
+            .hierarchical_builder
+            .build_tree_by_repo_id(&repo_id, tree_include_context, tree_context_lines)
+            .await?;
+        let tree_display = self.hierarchical_builder.create_display(tree);
+
+        // Imports (project-wide)
+        let imports = self.psi_manager.get_imports(&repo_id, None, true, true).await?;
+
+        // Call graph
+        let cg_opts = args.get("call_graph");
+        let cg_depth = cg_opts
+            .and_then(|c| c.get("depth"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize;
+        let cg_direction = cg_opts
+            .and_then(|c| c.get("direction"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("both")
+            .to_string();
+        let cg_include_external = cg_opts
+            .and_then(|c| c.get("include_external"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let call_graph = self
+            .psi_manager
+            .get_call_graph(&repo_id, None, cg_depth, &cg_direction, cg_include_external)
+            .await?;
+
+        // Format tree according to output_format.
+        let tree_payload: Value = match tree_output_format {
+            "json-compressed" => {
+                use std::io::Write;
+                use flate2::{write::GzEncoder, Compression};
+                use base64::Engine;
+                let json_str = serde_json::to_string(&tree_display)?;
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(json_str.as_bytes())?;
+                let compressed = encoder.finish()?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+                json!({
+                    "format": "json-compressed",
+                    "data": encoded,
+                    "original_size": json_str.len(),
+                    "compressed_size": compressed.len()
+                })
+            }
+            "bincode" => {
+                use base64::Engine;
+                let binary = bincode::serialize(&tree_display)?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&binary);
+                json!({
+                    "format": "bincode",
+                    "data": encoded,
+                    "binary_size": binary.len()
+                })
+            }
+            _ => serde_json::to_value(&tree_display)?,
+        };
+
+        let manifest = json!({
+            "tool": "lft_snapshot_project",
+            "repo_id": repo_id,
+            "project_path": project_path_opt,
+            "output_format": manifest_output_format,
+            "indexing": {
+                "ensure_indexed": ensure_indexed,
+                "reindex": reindex_mode,
+                "languages": languages,
+                "include_tests": include_tests,
+                "max_files": max_files,
+                "result": indexing_result
+            },
+            "snapshot": {
+                "stats": stats,
+                "tree": {
+                    "options": {
+                        "include_context": tree_include_context,
+                        "context_lines": tree_context_lines,
+                        "include_cross_refs": tree_include_cross_refs,
+                        "output_format": tree_output_format
+                    },
+                    "data": tree_payload
+                },
+                "imports": imports,
+                "call_graph": call_graph
+            }
+        });
+
+        // Format całego manifestu zgodnie z output_format.
+        let out = match manifest_output_format {
+            "json-compressed" => {
+                use std::io::Write;
+                use base64::Engine;
+                use flate2::{write::GzEncoder, Compression};
+
+                let json_str = serde_json::to_string(&manifest)?;
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(json_str.as_bytes())?;
+                let compressed = encoder.finish()?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+                // Zwracamy mały wrapper JSON, żeby klient wiedział co dostał bez zgadywania.
+                json!({
+                    "format": "json-compressed",
+                    "data": encoded,
+                    "original_size": json_str.len(),
+                    "compressed_size": compressed.len()
+                })
+                .to_string()
+            }
+            "bincode" => {
+                use base64::Engine;
+                let binary = bincode::serialize(&manifest)?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&binary);
+                json!({
+                    "format": "bincode",
+                    "data": encoded,
+                    "binary_size": binary.len()
+                })
+                .to_string()
+            }
+            _ => serde_json::to_string(&manifest)?,
+        };
+
+        Ok(out)
+    }
+
+    // LLM pack: uruchamia snapshot wewnetrznie i zwraca ZWIEZLY raport tekstowy (bez dumpowania drzewa/callgraph).
+    // To jest kluczowe na Windows i w czatach LLM: zamiast 300k linii dostajesz "mape" + metryki + instrukcje.
+    async fn handle_llm_pack_project(&mut self, args: &Value) -> Result<String> {
+        let include_snapshot_payload = args
+            .get("include_snapshot_payload")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let snapshot_payload_format = args
+            .get("snapshot_payload_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("json-compressed");
+
+        // 1) Zawsze robimy snapshot w JSON do analizy (lokalnie, w pamieci), bo musimy wyciagnac metryki.
+        let mut snap_args_json = args.clone();
+        if let Some(obj) = snap_args_json.as_object_mut() {
+            obj.insert("output_format".to_string(), Value::String("json".to_string()));
+        }
+        let snapshot_text_json = self.handle_snapshot_project(&snap_args_json).await?;
+        let snapshot_json: Value = serde_json::from_str(&snapshot_text_json)?;
+
+        // 2) Opcjonalnie: drugi snapshot jako payload (skompresowany wrapper), do przeniesienia offline.
+        let snapshot_payload_wrapper: Option<String> = if include_snapshot_payload {
+            let mut snap_args_payload = args.clone();
+            if let Some(obj) = snap_args_payload.as_object_mut() {
+                obj.insert(
+                    "output_format".to_string(),
+                    Value::String(snapshot_payload_format.to_string()),
+                );
+            }
+            Some(self.handle_snapshot_project(&snap_args_payload).await?)
+        } else {
+            None
+        };
+
+        let repo_id = snapshot_json
+            .get("repo_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)");
+        let project_path = snapshot_json
+            .get("project_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)");
+
+        let stats = snapshot_json
+            .pointer("/snapshot/stats")
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let nodes_total = stats.get("total_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+        let edges_total = stats.get("total_edges").and_then(|v| v.as_u64()).unwrap_or(0);
+        let files_tracked = stats.get("files_tracked").and_then(|v| v.as_u64()).unwrap_or(0);
+        let node_types = stats
+            .get("node_types")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        let functions_count = node_types.get("function").and_then(|v| v.as_u64()).unwrap_or(0);
+        let classes_count = node_types.get("class").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let cg = snapshot_json
+            .pointer("/snapshot/call_graph")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let cg_nodes = cg.get("nodes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let cg_edges = cg.get("edges").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+
+        let imports = snapshot_json
+            .pointer("/snapshot/imports")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let imports_total = imports.get("total_imports").and_then(|v| v.as_u64()).unwrap_or(0);
+        // `get_imports(..., group_by_file=true)` returns:
+        // - files_analyzed: number of files that had at least 1 import (because we only insert non-empty)
+        // - imports_by_file: object mapping file_path -> [imports]
+        // For group_by_file=false it returns: { total_imports, imports: [...] }
+        let files_with_imports = imports
+            .get("files_analyzed")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                imports
+                    .get("imports_by_file")
+                    .and_then(|v| v.as_object())
+                    .map(|o| o.len() as u64)
+            })
+            .or_else(|| imports.get("imports").and_then(|v| v.as_array()).map(|_| 0u64))
+            .unwrap_or(0);
+
+        let tree_opts = snapshot_json
+            .pointer("/snapshot/tree/options")
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        // --- Tree-derived summaries (no full dump) ---
+        // The snapshot tree can be:
+        // - full JSON (HierarchicalTreeDisplay)
+        // - or compressed wrapper (tree.output_format != json)
+        // We only compute top-lists when the tree is available as JSON.
+        // NOTE: `lft_snapshot_project` stores tree payload under `snapshot.tree.data`.
+        // `snapshot.tree.options` keeps the options.
+        let tree_value = snapshot_json
+            .pointer("/snapshot/tree/data")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let tree_display = if tree_value.is_object() {
+            tree_value.as_object().cloned()
+        } else {
+            None
+        };
+
+        let mut top_files_by_functions: Vec<(String, u64)> = Vec::new();
+        let mut top_complexity_functions: Vec<(String, String, Option<u64>, String)> = Vec::new();
+        if let Some(tree_obj) = tree_display {
+            if let Some(file_summary) = tree_obj.get("file_summary").and_then(|v| v.as_array()) {
+                for item in file_summary {
+                    let rel = item
+                        .get("relative_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    let cnt = item.get("function_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    top_files_by_functions.push((rel, cnt));
+                }
+            }
+
+            if let Some(top_functions) = tree_obj.get("top_functions").and_then(|v| v.as_array()) {
+                for tf in top_functions {
+                    let name = tf.get("name").and_then(|v| v.as_str()).unwrap_or("(unknown)").to_string();
+                    let file_path = tf
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)")
+                        .to_string();
+                    let rel_path = if project_path != "(unknown)" && file_path.to_lowercase().starts_with(&project_path.to_lowercase()) {
+                        file_path[project_path.len()..].trim_start_matches(['\\', '/']).to_string()
+                    } else {
+                        file_path.clone()
+                    };
+                    let complexity = tf.get("complexity").and_then(|v| v.as_u64());
+                    let line_range = tf.get("line_range").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                    top_complexity_functions.push((name, rel_path, complexity, line_range));
+                }
+            }
+        }
+
+        // --- Call-graph hubs (degree) ---
+        // We compute degree for nodes based on edges; this stays compact even if edges are large-ish.
+        let mut hub_degree: HashMap<String, u64> = HashMap::new();
+        if let Some(edges) = cg.get("edges").and_then(|v| v.as_array()) {
+            for e in edges {
+                // Expected shape: {from,to,...} (robust fallback for alternative keys)
+                let from = e.get("from")
+                    .or_else(|| e.get("source"))
+                    .and_then(|v| v.as_str());
+                let to = e.get("to")
+                    .or_else(|| e.get("target"))
+                    .and_then(|v| v.as_str());
+
+                if let Some(f) = from {
+                    *hub_degree.entry(f.to_string()).or_insert(0) += 1;
+                }
+                if let Some(t) = to {
+                    *hub_degree.entry(t.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut top_hubs: Vec<(String, u64)> = hub_degree.into_iter().collect();
+        top_hubs.sort_by(|a, b| b.1.cmp(&a.1));
+        top_hubs.truncate(20);
+
+        // --- Entrypoint hints (pure heuristic on filenames, still truth-from-files) ---
+        let mut entrypoint_candidates: Vec<(String, u64)> = top_files_by_functions
+            .iter()
+            .filter(|(p, _)| {
+                let s = p.to_lowercase();
+                s.contains("main")
+                    || s.contains("app")
+                    || s.contains("api")
+                    || s.contains("server")
+                    || s.contains("router")
+                    || s.contains("dispatch")
+                    || s.contains("wsgi")
+                    || s.contains("asgi")
+            })
+            .cloned()
+            .collect();
+        entrypoint_candidates.truncate(10);
+
+        let mut report = String::new();
+        report.push_str("RAPORT (prawda z kodu) - LFT LLM PACK\n");
+        report.push_str("================================\n\n");
+        report.push_str(&format!("Repo: {}\n", repo_id));
+        report.push_str(&format!("Project path: {}\n\n", project_path));
+
+        report.push_str("1) Skala i metryki\n");
+        report.push_str(&format!("- files_tracked: {}\n", files_tracked));
+        report.push_str(&format!("- functions: {}\n", functions_count));
+        report.push_str(&format!("- classes: {}\n", classes_count));
+        report.push_str(&format!("- psi_graph nodes/edges: {}/{}\n", nodes_total, edges_total));
+        report.push_str(&format!("- call_graph nodes/edges: {}/{}\n", cg_nodes, cg_edges));
+        report.push_str(&format!("- imports: total_imports={}, files_with_imports={}\n\n", imports_total, files_with_imports));
+
+        report.push_str("2) Najbardziej wartosciowe do zrozumienia (kolejnosc)\n");
+        report.push_str("- Hierarchical tree + kontekst: mapa modulow i funkcji (glowny punkt startowy).\n");
+        report.push_str("- Imports: spina architekture (warstwy, huby, cykle).\n");
+        report.push_str("- Call graph: weryfikuje przeplyw sterowania (impact, who-calls-who).\n\n");
+
+        report.push_str("3) Parametry tree w tym runie\n");
+        report.push_str(&format!("- tree.options: {}\n\n", serde_json::to_string(&tree_opts)?));
+
+        report.push_str("4) Top pliki i funkcje (z tree, bez dumpowania drzewa)\n");
+        if top_files_by_functions.is_empty() {
+            report.push_str("- top files: (brak - tree jest skompresowane lub puste; ustaw tree.output_format=json jesli chcesz te sekcje)\n");
+        } else {
+            report.push_str("- Top 10 plikow wg liczby funkcji:\n");
+            for (i, (p, c)) in top_files_by_functions.iter().take(10).enumerate() {
+                report.push_str(&format!("  {}. {} ({} funkcji)\n", i + 1, p, c));
+            }
+        }
+
+        if !top_complexity_functions.is_empty() {
+            report.push_str("- Top funkcje wg complexity (proxy na 'hotspoty'):\n");
+            for (i, (name, rel_path, cx, line_range)) in top_complexity_functions.iter().take(10).enumerate() {
+                let cx_s = cx.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+                report.push_str(&format!("  {}. {} (cx={}, {}:{})\n", i + 1, name, cx_s, rel_path, line_range));
+            }
+        }
+
+        if !entrypoint_candidates.is_empty() {
+            report.push_str("- Kandidaci na entrypointy (heurystyka po nazwie pliku):\n");
+            for (i, (p, c)) in entrypoint_candidates.iter().enumerate() {
+                report.push_str(&format!("  {}. {} ({} funkcji)\n", i + 1, p, c));
+            }
+        }
+
+        report.push_str("\n5) Huby z call-graph (degree)\n");
+        if top_hubs.is_empty() {
+            report.push_str("- (brak danych call graph)\n");
+        } else {
+            report.push_str("- Top 20 nazw funkcji (najczesciej polaczone w grafie wywolan):\n");
+            for (i, (name, deg)) in top_hubs.iter().enumerate() {
+                report.push_str(&format!("  {}. {} (degree={})\n", i + 1, name, deg));
+            }
+            report.push_str("- Jak wyciagnac kontekst hubow: uzyj lft_get_function_details {repo_id, function_name, context_lines}.\n");
+        }
+
+    report.push_str("\n6) Co teraz zrobic, zeby 'zrozumiec system' (konkret)\n");
+    report.push_str("- Wez 3 pierwsze pliki z Top 10 i odpal lft_get_file_functions (include_body=true) - to da 'prawde z kodu' w malych porcjach.\n");
+    report.push_str("- Wez 5 pierwszych hubow i odpal lft_get_function_details (include_callers/include_callees=true) - zobaczysz faktyczny przeplyw.\n");
+    report.push_str("- Dla entrypoint kandidatow: szukaj w nich wywolan do router/dispatcher/pricing/payment.\n\n");
+
+        if let Some(wrapper) = snapshot_payload_wrapper {
+            report.push_str("7) Snapshot payload (skompresowany wrapper JSON)\n");
+            report.push_str("SNAPSHOT_PAYLOAD_JSON_WRAPPER_BEGIN\n");
+            report.push_str(&wrapper);
+            report.push_str("\nSNAPSHOT_PAYLOAD_JSON_WRAPPER_END\n");
+        }
+
+        Ok(report)
+    }
+
+    /// Handle index project
+    async fn handle_index_project(&mut self, args: &Value) -> Result<String> {
+        let project_path = args.get("project_path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("Missing project_path parameter"))?;
+
+        // 🔥 ZAWSZE generujemy repo_id z project_path żeby uniknąć duplikatów w bazie
+        // Ignorujemy user-provided repo_id - project_path jest źródłem prawdy
+        let repo_id = self.psi_manager.get_or_create_repo_id(project_path).await?;
+
+        // Log if user provided different repo_id for consistency check
+        if let Some(user_repo_id) = args.get("repo_id").and_then(|r| r.as_str()) {
+            if user_repo_id != repo_id {
+                info!("🔄 User provided repo_id '{}' but using generated '{}' for path: {}",
+                      user_repo_id, repo_id, project_path);
+            }
+        }
+
+        // ZASADA: jak user nie poda `languages`, to robimy FULL SCAN projektu (katalog projektu = zakres).
+        // Czyli nie filtrujemy po języku w ogóle, tylko bierzemy wszystkie wspierane rozszerzenia,
+        // a śmieci tniemy wyłącznie przez hard skip-listy (node_modules/venv/target/etc.).
+        //
+        // Filtr językowy włączamy TYLKO gdy `languages` jest jawnie podane.
+        let languages: Option<Vec<String>> = args.get("languages")
+            .and_then(|l| l.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect());
+
+        let include_tests = args.get("include_tests")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(true);
+
+        let max_files = args.get("max_files")
+            .and_then(|m| m.as_u64())
+            .unwrap_or(1000) as usize;
+
+        // 🔥 NOWA LOGIKA: mode parametr decyduje o strategii indeksowania
+        let mode = args.get("mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("incremental");
+
+        match mode {
+            "replace" => {
+                info!("🔄 Replace mode: clearing existing index for repo_id: {}", repo_id);
+                // Usuń stary indeks
+                if let Err(e) = self.psi_manager.clear_repository(&repo_id).await {
+                    warn!("Failed to clear repository {}: {}", repo_id, e);
+                }
+            }
+            "incremental" => {
+                info!("⚡ Incremental mode: indexing only changed files for repo_id: {}", repo_id);
+            }
+            _ => {
+                return Err(anyhow!("Invalid mode: {}. Use 'incremental' or 'replace'", mode));
+            }
+        }
+
+        info!("🧬 Indexing project: {} (repo_id: {}, mode: {})", project_path, repo_id, mode);
+
+        let lang_refs: Option<Vec<&str>> = languages
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let index_result = self.psi_manager.index_project_incremental(
+            project_path,
+            &repo_id,
+            lang_refs.as_ref().map(|v| v.as_slice()),
+            false, // force_full_reindex = false, bo w replace mode już wyczyściliśmy bazę
+        ).await?;
+
+        // Cache: nie preloadujemy plików do RAM domyślnie (to jest ciężkie na Windows).
+        self.psi_manager.warm_cache_if_enabled().await?;
+
+        // NOTE(Windows/encoding): MCP clients commonly spawn the server with default console
+        // encoding (often cp1252). Unicode emoji can crash clients when they try to decode
+        // stdout/stderr as "text". Keep tool output ASCII by default.
+        let ascii_only = std::env::var("LFT_ASCII_ONLY")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(true);
+
+        // Tekst identyczny niezależnie od ascii_only, ale zostawiamy bramkę na przyszłość.
+        if ascii_only {
+            Ok(format!(
+                "Successfully indexed {} functions from project '{}' (repo_id: {})",
+                index_result.total_nodes,
+                project_path,
+                repo_id
+            ))
+        } else {
+            Ok(format!(
+                "Successfully indexed {} functions from project '{}' (repo_id: {})",
+                index_result.total_nodes,
+                project_path,
+                repo_id
+            ))
+        }
+    }
+
+    /// Handle incremental index project (RECOMMENDED)
+    async fn handle_index_incremental(&mut self, args: &Value) -> Result<String> {
+        let project_path = args.get("project_path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("Missing project_path parameter"))?;
+
+        // repo_id is now OPTIONAL - auto-generated from project folder name if not provided
+        let repo_id = if let Some(id) = args.get("repo_id").and_then(|r| r.as_str()) {
+            id.to_string()
+        } else {
+            self.psi_manager.get_or_create_repo_id(project_path).await?
+        };
+
+        let languages = args.get("languages")
+            .and_then(|l| l.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<&str>>());
+
+        let force_full_reindex = args.get("force_full_reindex")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false);
+
+        info!("🚀 INCREMENTAL indexing project: {} with repo_id: {} (force_full: {})",
+              project_path, repo_id, force_full_reindex);
+
+        let result = self.psi_manager.index_project_incremental(
+            project_path,
+            &repo_id,
+            languages.as_ref().map(|v| v.as_slice()),
+            force_full_reindex,
+        ).await?;
+
+        Ok(serde_json::to_string(&result)?)
+    }
+
+    /// Handle query functions
+    async fn handle_query_functions(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        // For now, return basic stats - can be extended with actual queries
+        let stats = self.psi_manager.get_repository_stats(repo_id).await?;
+
+        Ok(serde_json::to_string_pretty(&stats)?)
+    }
+
+    /// Handle get hierarchical tree
+    async fn handle_get_hierarchical_tree(&self, args: &Value) -> Result<String> {
+        // Tree is READ-ONLY: it should never implicitly index or create repo entries.
+        // Preferred input is repo_id. We still accept project_path, but ONLY as a lookup.
+        let repo_id: String = if let Some(repo_id) = args.get("repo_id").and_then(|r| r.as_str()) {
+            repo_id.to_string()
+        } else if let Some(project_path) = args.get("project_path").and_then(|p| p.as_str()) {
+            self.psi_manager.find_repo_id_by_project_path(project_path).await?
+                .ok_or_else(|| anyhow!(
+                    "Project '{}' is not indexed yet. Run lft_index_project first.",
+                    project_path
+                ))?
+        } else {
+            return Err(anyhow!("Missing repo_id (preferred) or project_path parameter"));
+        };
+
+        let apply_filtering = args.get("apply_filtering")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(true);
+
+        let min_complexity = args.get("min_complexity")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(1) as usize;
+
+        let include_private = args.get("include_private")
+            .and_then(|p| p.as_bool())
+            .unwrap_or(false);
+
+        let group_by_file = args.get("group_by_file")
+            .and_then(|g| g.as_bool())
+            .unwrap_or(true);
+
+        let include_context = args.get("include_context")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(true);
+
+        let context_lines = args.get("context_lines")
+            .and_then(|l| l.as_u64())
+            .unwrap_or(5) as usize;
+
+        let output_format = args.get("output_format")
+            .and_then(|f| f.as_str())
+            .unwrap_or("json");
+
+        let include_cross_refs = args.get("include_cross_refs")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(true);
+
+        // Build hierarchical tree (read-only) from already indexed repository
+        let tree = self.hierarchical_builder
+            .build_tree_by_repo_id(&repo_id, include_context, context_lines)
+            .await?;
+
+        // Create enhanced display
+        let display = self.hierarchical_builder.create_display(tree);
+
+        // Format output based on requested format
+        match output_format {
+            "json-compressed" => {
+                use std::io::Write;
+                use flate2::{write::GzEncoder, Compression};
+                use base64::Engine;
+
+                let json_str = serde_json::to_string(&display)?;
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(json_str.as_bytes())?;
+                let compressed = encoder.finish()?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+                Ok(serde_json::to_string(&serde_json::json!({
+                    "format": "json-compressed",
+                    "data": encoded,
+                    "original_size": json_str.len(),
+                    "compressed_size": compressed.len()
+                }))?)
+            },
+            "bincode" => {
+                use base64::Engine;
+                let binary = bincode::serialize(&display)?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&binary);
+
+                Ok(serde_json::to_string(&serde_json::json!({
+                    "format": "bincode",
+                    "data": encoded,
+                    "size": binary.len()
+                }))?)
+            },
+            _ => {
+                // Default JSON format with enhanced display
+                Ok(serde_json::to_string_pretty(&display)?)
+            }
+        }
+    }
+
+    /// Handle get stats
+    async fn handle_get_stats(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let stats = self.psi_manager.get_repository_stats(repo_id).await?;
+        Ok(serde_json::to_string_pretty(&stats)?)
+    }
+
+    /// Handle clear repository
+    async fn handle_clear_repository(&mut self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        info!("🗑️ Clearing repository: {}", repo_id);
+
+        self.psi_manager.clear_repository(repo_id).await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "repo_id": repo_id,
+            "status": "cleared",
+            "message": format!("Successfully cleared all data for repository: {}", repo_id)
+        }))?)
+    }
+
+    /// Handle list repositories
+    async fn handle_list_repositories(&mut self, _args: &Value) -> Result<String> {
+        info!("📋 Listing all repositories...");
+
+        let repositories = self.psi_manager.list_repositories().await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "repositories": repositories,
+            "total_count": repositories.len(),
+            "message": format!("Found {} repositories in database", repositories.len())
+        }))?)
+    }
+
+    /// Handle cleanup old repositories
+    async fn handle_cleanup_old(&mut self, args: &Value) -> Result<String> {
+        let keep_latest = args.get("keep_latest")
+            .and_then(|k| k.as_u64())
+            .unwrap_or(2) as usize;
+
+        info!("🧹 Cleaning up old repositories, keeping latest {}...", keep_latest);
+
+        self.psi_manager.cleanup_old_repositories(keep_latest).await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "keep_latest": keep_latest,
+            "status": "cleaned",
+            "message": format!("Successfully cleaned up old repositories, kept latest {} per project", keep_latest)
+        }))?)
+    }
+
+    /// Handle database stats
+    async fn handle_database_stats(&mut self, _args: &Value) -> Result<String> {
+        info!("📊 Getting database statistics...");
+
+        let stats = self.psi_manager.get_database_stats().await?;
+
+        Ok(serde_json::to_string(&stats)?)
+    }
+
+    /// Handle optimize database
+    async fn handle_optimize_database(&mut self, _args: &Value) -> Result<String> {
+        info!("🔧 Optimizing database...");
+
+        self.psi_manager.optimize_database().await?;
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "status": "optimized",
+            "message": "Database vacuum and analyze completed successfully"
+        }))?)
+    }
+
+    /// Handle clear DB (MCP tool)
+    ///
+    /// Contract:
+    /// - This tool is for maintenance. It can wipe all indexed data or only a single repo_id.
+    /// - `dry_run=true` never modifies the DB.
+    /// - By default we create a timestamped backup unless `no_backup=true`.
+    async fn handle_clear_db(&mut self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id").and_then(|r| r.as_str()).map(|s| s.to_string());
+        let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+        let no_backup = args.get("no_backup").and_then(|v| v.as_bool()).unwrap_or(false);
+        let vacuum = args.get("vacuum").and_then(|v| v.as_bool());
+
+        let db_path = db_maintenance::default_db_path()?;
+
+        let report = db_maintenance::clear_db(
+            &db_path,
+            db_maintenance::ClearDbOptions {
+                repo_id,
+                dry_run,
+                no_backup,
+                vacuum,
+            },
+        )?;
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "db_path": report.db_path,
+            "repo_id": report.repo_id,
+            "dry_run": report.dry_run,
+            "backup_path": report.backup_path,
+            "projects_before": report.projects_before,
+            "functions_before": report.functions_before,
+            "projects_after": report.projects_after,
+            "functions_after": report.functions_after,
+            "vacuum_ran": report.vacuum_ran
+        }))?)
+    }
+
+    /// Handle start watch
+    async fn handle_start_watch(&mut self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let project_path = args.get("project_path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("Missing project_path parameter"))?;
+
+        let debounce_delay = args.get("debounce_delay")
+            .and_then(|d| d.as_u64())
+            .unwrap_or(500);
+
+        // Start file watching (placeholder for now)
+        info!("👀 Starting file watch for repo {} at {}", repo_id, project_path);
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "repo_id": repo_id,
+            "project_path": project_path,
+            "debounce_delay": debounce_delay,
+            "status": "watching",
+            "message": "Real-time file watching started successfully"
+        }))?)
+    }
+
+    /// Handle search functions - search by name pattern
+    async fn handle_search_functions(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let pattern = args.get("pattern")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow!("Missing pattern parameter"))?;
+
+        let is_regex = args.get("is_regex")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+
+        let language = args.get("language")
+            .and_then(|l| l.as_str());
+
+        let include_body = args.get("include_body")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+
+        let context_lines = args.get("context_lines")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(3) as usize;
+
+        let max_results = args.get("max_results")
+            .and_then(|m| m.as_u64())
+            .unwrap_or(50) as usize;
+
+        info!("🔍 Searching functions in {} with pattern: {}", repo_id, pattern);
+
+        let results = self.psi_manager.search_functions(
+            repo_id,
+            pattern,
+            is_regex,
+            language,
+            include_body,
+            context_lines,
+            max_results,
+        ).await?;
+
+        Ok(serde_json::to_string_pretty(&json!({
+            "repo_id": repo_id,
+            "pattern": pattern,
+            "total_matches": results.len(),
+            "functions": results
+        }))?)
+    }
+
+    /// Handle get file functions - get all functions from specific file
+    async fn handle_get_file_functions(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let file_path = args.get("file_path")
+            .and_then(|f| f.as_str())
+            .ok_or_else(|| anyhow!("Missing file_path parameter"))?;
+
+        let include_body = args.get("include_body")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true);
+
+        let context_lines = args.get("context_lines")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(5) as usize;
+
+        info!("📄 Getting functions from file: {} in repo: {}", file_path, repo_id);
+
+        let results = self.psi_manager.get_file_functions(
+            repo_id,
+            file_path,
+            include_body,
+            context_lines,
+        ).await?;
+
+        Ok(serde_json::to_string_pretty(&json!({
+            "repo_id": repo_id,
+            "file_path": file_path,
+            "total_functions": results.len(),
+            "functions": results
+        }))?)
+    }
+
+    /// Handle get function details - full details about specific function
+    async fn handle_get_function_details(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let function_name = args.get("function_name")
+            .and_then(|f| f.as_str())
+            .ok_or_else(|| anyhow!("Missing function_name parameter"))?;
+
+        let file_path = args.get("file_path")
+            .and_then(|f| f.as_str());
+
+        let include_callers = args.get("include_callers")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(true);
+
+        let include_callees = args.get("include_callees")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(true);
+
+        let context_lines = args.get("context_lines")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(10) as usize;
+
+        info!("🔎 Getting details for function: {} in repo: {}", function_name, repo_id);
+
+        let result = self.psi_manager.get_function_details(
+            repo_id,
+            function_name,
+            file_path,
+            include_callers,
+            include_callees,
+            context_lines,
+        ).await?;
+
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    /// Handle get imports - analyze imports in files
+    async fn handle_get_imports(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let file_path = args.get("file_path")
+            .and_then(|f| f.as_str());
+
+        let include_external = args.get("include_external")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(true);
+
+        let group_by_file = args.get("group_by_file")
+            .and_then(|g| g.as_bool())
+            .unwrap_or(true);
+
+        info!("📦 Analyzing imports in repo: {}", repo_id);
+
+        let results = self.psi_manager.get_imports(
+            repo_id,
+            file_path,
+            include_external,
+            group_by_file,
+        ).await?;
+
+        Ok(serde_json::to_string_pretty(&results)?)
+    }
+
+    /// Handle get call graph - function call relationships
+    async fn handle_get_call_graph(&self, args: &Value) -> Result<String> {
+        let repo_id = args.get("repo_id")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow!("Missing repo_id parameter"))?;
+
+        let function_name = args.get("function_name")
+            .and_then(|f| f.as_str());
+
+        let depth = args.get("depth")
+            .and_then(|d| d.as_u64())
+            .unwrap_or(3) as usize;
+
+        let direction = args.get("direction")
+            .and_then(|d| d.as_str())
+            .unwrap_or("both");
+
+        let include_external = args.get("include_external")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false);
+
+        info!("🔗 Building call graph for repo: {}", repo_id);
+
+        let result = self.psi_manager.get_call_graph(
+            repo_id,
+            function_name,
+            depth,
+            direction,
+            include_external,
+        ).await?;
+
+        Ok(serde_json::to_string_pretty(&result)?)
+    }
+
+    /// Handle CFG analysis for function or file
+    async fn handle_analyze_cfg(&self, args: &Value) -> Result<String> {
+        let file_path = args.get("file_path")
+            .and_then(|f| f.as_str())
+            .ok_or_else(|| anyhow!("Missing file_path parameter"))?;
+
+        let function_name = args.get("function_name")
+            .and_then(|f| f.as_str());
+
+        let include_context = args.get("include_context")
+            .and_then(|i| i.as_bool())
+            .unwrap_or(true);
+
+        let context_lines = args.get("context_lines")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(3) as usize;
+
+        info!("🔍 Analyzing CFG for file: {}", file_path);
+
+        // Read file content
+        let content = std::fs::read_to_string(file_path)
+            .map_err(|e| anyhow!("Failed to read file {}: {}", file_path, e))?;
+
+        let analyzer = SimpleCfgAnalyzer;
+        let mut results = Vec::new();
+
+        if let Some(func_name) = function_name {
+            // Analyze specific function - find function bounds
+            let lines: Vec<&str> = content.lines().collect();
+            let mut start_line = 0;
+            let mut end_line = lines.len();
+
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains(&format!("fn {}", func_name)) ||
+                   line.contains(&format!("def {}", func_name)) ||
+                   line.contains(&format!("function {}", func_name)) {
+                    start_line = i;
+                    let mut brace_count = 0;
+                    for (j, l) in lines[i..].iter().enumerate() {
+                        brace_count += l.matches('{').count() as i32;
+                        brace_count -= l.matches('}').count() as i32;
+                        if brace_count == 0 && j > 0 {
+                            end_line = i + j + 1;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            let result = analyzer.analyze_function(func_name, file_path, &content, start_line, end_line)?;
+            results.push(result);
+        } else {
+            // Analyze all functions - use tree-sitter
+            use crate::tree_sitter_extractor::{TreeSitterExtractor, SupportedLanguage};
+
+            let ext = std::path::Path::new(file_path).extension().and_then(|e| e.to_str()).unwrap_or("");
+            if let Some(lang) = SupportedLanguage::from_extension(ext) {
+                let mut extractor = TreeSitterExtractor::new()?;
+                let functions = extractor.extract_functions(&content, file_path, lang)?;
+
+                for func in functions {
+                    let result = analyzer.analyze_function(
+                        &func.name, file_path, &content,
+                        func.start_line.saturating_sub(1), func.end_line
+                    )?;
+                    results.push(result);
+                }
+            } else {
+                return Err(anyhow!("Unsupported file extension: {}", ext));
+            }
+        }
+
+        // Add context if requested
+        if include_context {
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            for result in &mut results {
+                for issue in &mut result.unreachable_issues {
+                    let line_num = issue.line_number;
+                    let start = line_num.saturating_sub(context_lines).max(1);
+                    let end = (line_num + context_lines).min(lines.len());
+
+                    issue.context_before = Some(lines[start.saturating_sub(1)..line_num.saturating_sub(1)]
+                        .iter().enumerate().map(|(i, l)| format!("{}: {}", start + i, l)).collect());
+                    issue.context_after = Some(lines[line_num..end]
+                        .iter().enumerate().map(|(i, l)| format!("{}: {}", line_num + 1 + i, l)).collect());
+                }
+            }
+        }
+
+        let total_issues: usize = results.iter().map(|r| r.unreachable_issues.len()).sum();
+        let functions_with_issues = results.iter().filter(|r| r.has_unreachable_code).count();
+
+        let response = json!({
+            "file_path": file_path,
+            "total_functions_analyzed": results.len(),
+            "functions_with_unreachable_code": functions_with_issues,
+            "total_unreachable_issues": total_issues,
+            "results": results,
+            "summary": format!("Analyzed {} function(s): found {} unreachable code block(s) in {} function(s)",
+                results.len(), total_issues, functions_with_issues)
+        });
+
+        Ok(serde_json::to_string_pretty(&response)?)
+    }
+
+    /// Handle project-wide unreachable code detection
+    async fn handle_detect_unreachable(&mut self, args: &Value) -> Result<String> {
+        let repo_id_opt = args.get("repo_id").and_then(|r| r.as_str());
+        let project_path_opt = args.get("project_path").and_then(|p| p.as_str());
+
+        let repo_id = if let Some(rid) = repo_id_opt {
+            rid.to_string()
+        } else if let Some(path) = project_path_opt {
+            self.psi_manager.get_or_create_repo_id(path).await?
+        } else {
+            return Err(anyhow!("Must provide either repo_id or project_path"));
+        };
+
+        let severity_filter = args.get("severity_filter").and_then(|s| s.as_str()).unwrap_or("Medium");
+        let max_results = args.get("max_results").and_then(|m| m.as_u64()).unwrap_or(100) as usize;
+
+        info!("🔍 Scanning repo {} for unreachable code", repo_id);
+
+        // Get project path for resolving relative file paths
+        let project_path = self.psi_manager.get_project_path(&repo_id).await?
+            .ok_or_else(|| anyhow!("Project path not found for repo: {}", repo_id))?;
+        info!("📂 Project path: {}", project_path);
+
+        let functions = self.psi_manager.get_all_functions(&repo_id).await?;
+        info!("📊 Analyzing {} functions...", functions.len());
+
+        // Filter functions that have unreachable code (from database)
+        let functions_with_issues: Vec<_> = functions.iter()
+            .filter(|f| f.has_unreachable_code == Some(true))
+            .collect();
+
+        info!("🔥 Found {} functions with unreachable code in database", functions_with_issues.len());
+
+        let mut all_issues = Vec::new();
+        let mut files_processed = std::collections::HashSet::new();
+
+        // Group functions by file to process all files (not limited by max_results per function)
+        let mut file_to_functions = std::collections::HashMap::new();
+
+        for func in functions_with_issues.iter() {
+            file_to_functions.entry(func.file_path.clone())
+                .or_insert_with(Vec::new)
+                .push(func);
+        }
+
+        info!("📁 Processing {} unique files with unreachable code", file_to_functions.len());
+
+        // Normalize project path separators for Windows
+        let normalized_project_path = project_path.replace("/", "\\");
+        info!("🔧 Project path normalized: {} -> {}", project_path, normalized_project_path);
+
+        // Process all files with flagged functions
+        for (file_path, file_functions) in file_to_functions.iter() {
+            files_processed.insert(file_path.clone());
+
+            // Normalize file path separators for Windows (database may have mixed / and \)
+            let normalized_file_path = file_path.replace("/", "\\");
+
+            // Build full file path: normalized_project_path + normalized_file_path
+            let full_path = std::path::Path::new(&normalized_project_path).join(&normalized_file_path);
+
+            info!("📄 Reading file: {} + {} = {}",
+                  normalized_project_path, normalized_file_path, full_path.display());
+
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("❌ Failed to read file {} (full path: {}): {}",
+                          file_path, full_path.display(), e);
+                    continue;
+                }
+            };
+
+            // Process each function in this file
+            for func in file_functions.iter() {
+                let analyzer = SimpleCfgAnalyzer::new();
+                let result = match analyzer.analyze_function(
+                    &func.name, &func.file_path, &content,
+                    func.start_line.saturating_sub(1), func.end_line
+                ) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                for issue in result.unreachable_issues {
+                    let severity_matches = match severity_filter {
+                        "High" => issue.severity == Severity::High,
+                        "Medium" => issue.severity == Severity::High || issue.severity == Severity::Medium,
+                        _ => true,
+                    };
+
+                    if severity_matches && all_issues.len() < max_results {
+                        all_issues.push(json!({
+                            "function": func.name,
+                            "file": func.file_path,
+                            "line": issue.line_number,
+                            "severity": issue.severity,
+                            "reason": issue.reason,
+                            "code": issue.code,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let mut severity_counts = std::collections::HashMap::new();
+        for issue in &all_issues {
+            let severity = issue.get("severity").and_then(|s| s.as_str()).unwrap_or("Unknown");
+            *severity_counts.entry(severity).or_insert(0) += 1;
+        }
+
+        let response = json!({
+            "repo_id": repo_id,
+            "total_functions_analyzed": functions.len(),
+            "files_scanned": files_processed.len(),
+            "total_issues_found": all_issues.len(),
+            "severity_breakdown": severity_counts,
+            "issues": &all_issues[..all_issues.len().min(max_results)],
+            "summary": format!("Scanned {} functions across {} files: found {} issue(s)",
+                functions.len(), files_processed.len(), all_issues.len())
+        });
+
+        Ok(serde_json::to_string_pretty(&response)?)
+    }
+
+    /// Run the MCP server
+    pub async fn run(&mut self) -> Result<()> {
+        info!("🚀 Starting Live Function Tree MCP Server...");
+        info!("📡 Listening on stdin/stdout for MCP protocol messages");
+
+        let stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    debug!("📥 EOF received, shutting down");
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    info!("📨 Received from RooCode: {}", trimmed);
+
+                    match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                        Ok(request) => {
+                            // Check if this is a notification (no id or id is null)
+                            // JSON-RPC 2.0: Notifications MUST NOT have responses
+                            let is_notification = request.id.is_none()
+                                || request.id.as_ref().map(|v| v.is_null()).unwrap_or(false)
+                                || request.method.starts_with("notifications/");
+
+                            if is_notification {
+                                // Process notification but don't send response
+                                debug!("📭 Received notification: {} (no response needed)", request.method);
+                                if let Err(e) = self.process_request(&request.method, &request).await {
+                                    warn!("⚠️ Notification processing error (ignored): {}", e);
+                                }
+                                continue;
+                            }
+
+                            let response = match request.method.as_str() {
+                                "initialize" => {
+                                    match self.initialize(request.params).await {
+                                        Ok(result) => JsonRpcResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: request.id,
+                                            result: Some(result),
+                                            error: None,
+                                        },
+                                        Err(e) => JsonRpcResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: request.id,
+                                            result: None,
+                                            error: Some(JsonRpcError {
+                                                code: -32603,
+                                                message: format!("Internal error: {}", e),
+                                                data: None,
+                                            }),
+                                        }
+                                    }
+                                },
+                                method => {
+                                    match self.process_request(method, &request).await {
+                                        Ok(result) => JsonRpcResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: request.id,
+                                            result: Some(result),
+                                            error: None,
+                                        },
+                                        Err(e) => JsonRpcResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: request.id,
+                                            result: None,
+                                            error: Some(JsonRpcError {
+                                                code: -32603,
+                                                message: format!("Internal error: {}", e),
+                                                data: None,
+                                            }),
+                                        }
+                                    }
+                                }
+                            };
+
+                            let response_json = serde_json::to_string(&response)?;
+                            debug!("📤 Sending: {}", response_json);
+                            stdout.write_all(response_json.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to parse JSON-RPC request: {}", e);
+                            let error_response = JsonRpcResponse {
+                                jsonrpc: "2.0".to_string(),
+                                id: None,
+                                result: None,
+                                error: Some(JsonRpcError {
+                                    code: -32700,
+                                    message: "Parse error".to_string(),
+                                    data: None,
+                                }),
+                            };
+                            let response_json = serde_json::to_string(&error_response)?;
+                            stdout.write_all(response_json.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to read from stdin: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
